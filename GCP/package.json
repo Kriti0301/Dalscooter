@@ -1,0 +1,10 @@
+{
+  "name": "dalscooter-functions",
+  "version": "1.0.0",
+  "main": "index.js",
+  "dependencies": {
+    "@google-cloud/firestore": "^7.6.1",
+    "@google-cloud/functions-framework": "^3.3.0",
+    "axios": "^1.11.0"
+  }
+}

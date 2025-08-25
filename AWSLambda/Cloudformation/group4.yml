@@ -1,0 +1,3950 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Combined CloudFormation template for Cognito, Lambdas, HTTP API, and Notification system.
+
+Parameters:
+  SmtpHostParameter:
+    Type: String
+    Description: SMTP host (e.g. smtp.gmail.com)
+  SmtpPortParameter:
+    Type: Number
+    Default: 587
+    Description: SMTP port (usually 587)
+  SmtpUserParameter:
+    Type: String
+    Description: SMTP username/email
+  SmtpPassParameter:
+    Type: String
+    NoEcho: true
+    Description: SMTP password or app password
+  SenderEmailParameter:
+    Type: String
+    Description: Sender email address (e.g. no-reply@dalscooter.com)
+  LabRoleArn:
+    Type: String
+    Description: ARN of the IAM Role all Lambdas will assume
+    Default: arn:aws:iam::${AWS::AccountId}:role/LabRole
+
+Resources:
+  # Booking & Auth tables
+  ScootersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: Scooters
+      AttributeDefinitions:
+        - AttributeName: scooter_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: scooter_id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  TripsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: Trips
+      AttributeDefinitions:
+        - AttributeName: trip_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: trip_id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: Users
+      AttributeDefinitions:
+        - AttributeName: email
+          AttributeType: S
+      KeySchema:
+        - AttributeName: email
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  CustomerFranchiseMessagesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: CustomerFranchiseMessages
+      AttributeDefinitions:
+        - AttributeName: messageId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: messageId
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  PendingChatRequestsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: PendingChatRequests
+      AttributeDefinitions:
+        - AttributeName: trip_id
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: trip_id
+          KeyType: HASH
+        - AttributeName: created_at
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+
+  TripMessagesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: TripMessages
+      AttributeDefinitions:
+        - AttributeName: trip_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: trip_id
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+
+  AnalyticsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: Analytics
+      AttributeDefinitions:
+        - AttributeName: metric_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: metric_id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  FeedbacksTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: Feedbacks
+      AttributeDefinitions:
+        - AttributeName: feedback_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: feedback_id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  UserSessionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: UserSessions
+      AttributeDefinitions:
+        - AttributeName: session_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: session_id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+
+  # SNS Topic for user notifications
+  UserNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: userNotification
+
+  # SQS Queue subscribed to SNS Topic
+  NotificationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: userNotificationQueue
+
+  # Subscribe SQS Queue to SNS Topic
+  SnsToSqsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref UserNotificationTopic
+      Protocol: sqs
+      Endpoint: !GetAtt NotificationQueue.Arn
+
+  # Allow SNS to send messages to SQS
+  NotificationQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [ !Ref NotificationQueue ]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Allow-SNS-SendMessage
+            Effect: Allow
+            Principal: '*'
+            Action: sqs:SendMessage
+            Resource: !GetAtt NotificationQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref UserNotificationTopic
+
+  ########################################
+  # Lambda: PostConfirmation trigger
+  AssignUserGroupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: AssignUserGroup
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !Ref LabRoleArn
+      Code:
+        ZipFile: |
+          const { CognitoIdentityProviderClient, AdminAddUserToGroupCommand } = require("@aws-sdk/client-cognito-identity-provider");
+          const cognito = new CognitoIdentityProviderClient({});
+          exports.handler = async (event) => {
+            const userPoolId = event.userPoolId;
+            const username = event.userName;
+            const role = event.request.userAttributes["custom:role"];
+            if (role === "franchise" || role === "user") {
+              await cognito.send(new AdminAddUserToGroupCommand({
+                GroupName: role,
+                UserPoolId: userPoolId,
+                Username: username
+              }));
+            }
+            return event;
+          };
+      MemorySize: 128
+      Timeout: 10
+
+  SetUserSessionsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: SetUserSessions
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !Ref LabRoleArn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          from datetime import datetime, timedelta
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
+          USER_SESSIONS_TABLE = dynamodb.Table('UserSessions')
+
+          def lambda_handler(event, context):
+              """
+              Manage user sessions - create, update, and end sessions
+              """
+              
+              try:
+                  # Parse request
+                  if event.get('body'):
+                      if isinstance(event['body'], str):
+                          body = json.loads(event['body'])
+                      else:
+                          body = event['body']
+                  else:
+                      return create_response(400, {'error': 'Request body is required'})
+                  
+                  action = body.get('action')  # 'login', 'logout', 'update'
+                  
+                  if action == 'login':
+                      return handle_login(body)
+                  elif action == 'logout':
+                      return handle_logout(body)
+                  elif action == 'update':
+                      return handle_update(body)
+                  else:
+                      return create_response(400, {'error': 'Invalid action. Use: login, logout, update'})
+                      
+              except Exception as e:
+                  logger.error(f"Error in session manager: {str(e)}")
+                  return create_response(500, {'error': f'Internal server error: {str(e)}'})
+
+          def handle_login(body):
+              """
+              Create a new user session on login
+              """
+              try:
+                  # Required fields
+                  user_id = body.get('user_id')
+                  user_role = body.get('user_role', 'user')
+                  ip_address = body.get('ip_address', 'unknown')
+                  user_agent = body.get('user_agent', 'unknown')
+                  
+                  if not user_id:
+                      return create_response(400, {'error': 'user_id is required'})
+                  
+                  # Generate session
+                  session_id = f"session_{str(uuid.uuid4())[:8]}"
+                  current_time = datetime.utcnow()
+                  login_time = current_time.isoformat() + 'Z'
+                  
+                  # Calculate TTL (24 hours from now)
+                  ttl_time = current_time + timedelta(hours=24)
+                  ttl = int(ttl_time.timestamp())
+                  
+                  session_item = {
+                      'session_id': session_id,
+                      'user_id': user_id,
+                      'user_role': user_role,
+                      'ip_address': ip_address,
+                      'user_agent': user_agent,
+                      'login_time': login_time,
+                      'logout_time': None,
+                      'session_duration': None,
+                      'ttl': ttl
+                  }
+                  
+                  # Store session
+                  USER_SESSIONS_TABLE.put_item(Item=session_item)
+                  
+                  logger.info(f"Created session {session_id} for user {user_id}")
+                  
+                  return create_response(201, {
+                      'message': 'Session created successfully',
+                      'session_id': session_id,
+                      'login_time': login_time
+                  })
+                  
+              except Exception as e:
+                  logger.error(f"Error creating session: {str(e)}")
+                  return create_response(500, {'error': f'Failed to create session: {str(e)}'})
+
+          def handle_logout(body):
+              """
+              End a user session on logout
+              """
+              try:
+                  session_id = body.get('session_id')
+                  user_id = body.get('user_id')
+                  
+                  if not session_id and not user_id:
+                      return create_response(400, {'error': 'session_id or user_id is required'})
+                  
+                  current_time = datetime.utcnow()
+                  logout_time = current_time.isoformat() + 'Z'
+                  
+                  # Find session to update
+                  if session_id:
+                      # Update by session_id
+                      try:
+                          response = USER_SESSIONS_TABLE.get_item(Key={'session_id': session_id})
+                          if 'Item' not in response:
+                              return create_response(404, {'error': 'Session not found'})
+                          
+                          session = response['Item']
+                          login_time_str = session.get('login_time')
+                          
+                          # Calculate duration
+                          duration = 0
+                          if login_time_str:
+                              try:
+                                  login_dt = datetime.fromisoformat(login_time_str.replace('Z', '+00:00'))
+                                  duration = int((current_time - login_dt.replace(tzinfo=None)).total_seconds() / 60)
+                              except:
+                                  pass
+                          
+                          # Update session
+                          USER_SESSIONS_TABLE.update_item(
+                              Key={'session_id': session_id},
+                              UpdateExpression='SET logout_time = :logout_time, session_duration = :duration',
+                              ExpressionAttributeValues={
+                                  ':logout_time': logout_time,
+                                  ':duration': duration
+                              }
+                          )
+                          
+                          logger.info(f"Updated session {session_id} with logout time")
+                          
+                          return create_response(200, {
+                              'message': 'Session ended successfully',
+                              'session_id': session_id,
+                              'logout_time': logout_time,
+                              'duration_minutes': duration
+                          })
+                          
+                      except Exception as e:
+                          logger.error(f"Error updating session {session_id}: {str(e)}")
+                          return create_response(500, {'error': f'Failed to update session: {str(e)}'})
+                  
+                  else:
+                      # Find active session by user_id
+                      try:
+                          response = USER_SESSIONS_TABLE.scan(
+                              FilterExpression='user_id = :user_id AND attribute_not_exists(logout_time)',
+                              ExpressionAttributeValues={':user_id': user_id}
+                          )
+                          
+                          sessions = response.get('Items', [])
+                          if not sessions:
+                              return create_response(404, {'error': 'No active session found for user'})
+                          
+                          # Update the most recent session
+                          session = sessions[0]
+                          session_id = session['session_id']
+                          
+                          login_time_str = session.get('login_time')
+                          duration = 0
+                          if login_time_str:
+                              try:
+                                  login_dt = datetime.fromisoformat(login_time_str.replace('Z', '+00:00'))
+                                  duration = int((current_time - login_dt.replace(tzinfo=None)).total_seconds() / 60)
+                              except:
+                                  pass
+                          
+                          USER_SESSIONS_TABLE.update_item(
+                              Key={'session_id': session_id},
+                              UpdateExpression='SET logout_time = :logout_time, session_duration = :duration',
+                              ExpressionAttributeValues={
+                                  ':logout_time': logout_time,
+                                  ':duration': duration
+                              }
+                          )
+                          
+                          logger.info(f"Updated session {session_id} for user {user_id}")
+                          
+                          return create_response(200, {
+                              'message': 'Session ended successfully',
+                              'session_id': session_id,
+                              'logout_time': logout_time,
+                              'duration_minutes': duration
+                          })
+                          
+                      except Exception as e:
+                          logger.error(f"Error finding/updating session for user {user_id}: {str(e)}")
+                          return create_response(500, {'error': f'Failed to end session: {str(e)}'})
+              
+              except Exception as e:
+                  logger.error(f"Error in logout handler: {str(e)}")
+                  return create_response(500, {'error': f'Logout failed: {str(e)}'})
+
+          def handle_update(body):
+              """
+              Update session information (like user_agent, ip_address)
+              """
+              try:
+                  session_id = body.get('session_id')
+                  if not session_id:
+                      return create_response(400, {'error': 'session_id is required'})
+                  
+                  # Build update expression
+                  update_parts = []
+                  attr_values = {}
+                  
+                  if 'ip_address' in body:
+                      update_parts.append('ip_address = :ip')
+                      attr_values[':ip'] = body['ip_address']
+                  
+                  if 'user_agent' in body:
+                      update_parts.append('user_agent = :ua')
+                      attr_values[':ua'] = body['user_agent']
+                  
+                  if not update_parts:
+                      return create_response(400, {'error': 'No fields to update'})
+                  
+                  update_expression = 'SET ' + ', '.join(update_parts)
+                  
+                  USER_SESSIONS_TABLE.update_item(
+                      Key={'session_id': session_id},
+                      UpdateExpression=update_expression,
+                      ExpressionAttributeValues=attr_values
+                  )
+                  
+                  return create_response(200, {'message': 'Session updated successfully'})
+                  
+              except Exception as e:
+                  logger.error(f"Error updating session: {str(e)}")
+                  return create_response(500, {'error': f'Failed to update session: {str(e)}'})
+
+          def create_response(status_code, body):
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+                      'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+                  },
+                  'body': json.dumps(body, default=str)
+              }
+      MemorySize: 128
+      Timeout: 30
+
+  # Lambda: user registration
+  UserRegisterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: UserRegister
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !Ref LabRoleArn
+      Environment:
+        Variables:
+          USER_NOTIFICATION_TOPIC_ARN: !Ref UserNotificationTopic
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+
+          dynamodb = boto3.resource('dynamodb')
+          sns = boto3.client('sns')
+          TOPIC_ARN = os.environ['USER_NOTIFICATION_TOPIC_ARN']
+
+          def lambda_handler(event, context):
+              body = json.loads(event.get('body','{}'))
+              missing = [k for k in ['email','name','role','securityAnswer','shiftKey'] if not body.get(k)]
+              if missing:
+                  return {'statusCode':400,'body':json.dumps({'error':f"Missing fields: {', '.join(missing)}"})}
+              item = {k: body[k] for k in ['email','name','role','securityAnswer','shiftKey']}
+              dynamodb.Table('Users').put_item(Item=item)
+              # publish to SNS
+              message = {'to':body['email'],'subject':'Welcome to Dal scooter!','body':f"Hi {body['name']}, welcome to Dal scooter!"}
+              sns.publish(TopicArn=TOPIC_ARN, Message=json.dumps(message))
+              return {'statusCode':200,'body':json.dumps({'message':'User registered'})}
+      MemorySize: 128
+      Timeout: 10
+
+  # Lambda: fetch security answer
+  FetchSecurityAnswerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: FetchSecurityAnswer
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !Ref LabRoleArn
+      Code:
+        ZipFile: |
+          import json, boto3
+          table = boto3.resource('dynamodb').Table('Users')
+          def lambda_handler(event, context):
+              body=json.loads(event.get('body','{}'))
+              email=body.get('email')
+              if not email:
+                  return {'statusCode':400,'body':json.dumps({'error':'Email required'})}
+              resp = table.get_item(Key={'email':email})
+              if 'Item' not in resp:
+                  return {'statusCode':404,'body':json.dumps({'error':'User not found'})}
+              return {'statusCode':200,'body':json.dumps({'securityAnswer':resp['Item']['securityAnswer']})}
+      MemorySize: 128
+      Timeout: 10
+
+  # Lambda: fetch shift key
+  FetchShiftKeyFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: FetchShiftKey
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !Ref LabRoleArn
+      Environment:
+        Variables:
+          USER_NOTIFICATION_TOPIC_ARN: !Ref UserNotificationTopic
+      Code:
+        ZipFile: |
+          import json, boto3
+          import os
+
+          sns = boto3.client('sns')
+          TOPIC_ARN = os.environ['USER_NOTIFICATION_TOPIC_ARN']
+
+          table = boto3.resource('dynamodb').Table('Users')
+          def lambda_handler(event, context):
+              body=json.loads(event.get('body','{}'))
+              email=body.get('email')
+              if not email:
+                  return {'statusCode':400,'body':json.dumps({'error':'Email required'})}
+              resp = table.get_item(Key={'email':email})
+              if 'Item' not in resp:
+                  return {'statusCode':404,'body':json.dumps({'error':'User not found'})}
+              
+              # publish to SNS
+              message = {'to':email,'subject':'Login Alert for Your Dal Scooter Account','body':f"Hi,\n\nWe noticed a new login to your Dal Scooter account.\nIf this wasn't you, please reset your password immediately.\n\nStay safe,\nDal Scooter Team"}
+              sns.publish(TopicArn=TOPIC_ARN, Message=json.dumps(message))
+
+              return {'statusCode':200,'body':json.dumps({'shiftKey':resp['Item']['shiftKey']})}
+      MemorySize: 128
+      Timeout: 10
+
+  ########################################
+  # Notification Sender Lambda triggered by SQS
+  SendEmailFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: SendEmail
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !Ref LabRoleArn
+      Environment:
+        Variables:
+          SMTP_HOST: !Ref SmtpHostParameter
+          SMTP_PORT: !Ref SmtpPortParameter
+          SMTP_USER: !Ref SmtpUserParameter
+          SMTP_PASS: !Ref SmtpPassParameter
+          SENDER_EMAIL: !Ref SenderEmailParameter
+      Code:
+        ZipFile: |
+          import json
+          import smtplib
+          import os
+          from email.mime.text import MIMEText
+          from email.mime.multipart import MIMEMultipart
+
+          SMTP_HOST = os.environ['SMTP_HOST']
+          SMTP_PORT = int(os.environ.get('SMTP_PORT',587))
+          SMTP_USER = os.environ['SMTP_USER']
+          SMTP_PASS = os.environ['SMTP_PASS']
+          SENDER_EMAIL = os.environ['SENDER_EMAIL']
+
+          def lambda_handler(event, context):
+              for record in event.get('Records', []):
+                  sns_msg = json.loads(record['body'])
+                  email_data = json.loads(sns_msg['Message'])
+                  msg = MIMEMultipart()
+                  msg['From'] = SENDER_EMAIL
+                  msg['To'] = email_data['to']
+                  msg['Subject'] = email_data['subject']
+                  msg.attach(MIMEText(email_data['body'],'plain'))
+                  with smtplib.SMTP(SMTP_HOST,SMTP_PORT) as server:
+                      server.starttls()
+                      server.login(SMTP_USER,SMTP_PASS)
+                      server.sendmail(SENDER_EMAIL,email_data['to'],msg.as_string())
+              return {'statusCode':200,'body':json.dumps('Processed.')}
+      MemorySize: 128
+      Timeout: 30
+
+  # Trigger SendEmailFunction from SQS
+  SendEmailEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt NotificationQueue.Arn
+      FunctionName: !GetAtt SendEmailFunction.Arn
+      BatchSize: 10
+      Enabled: true
+
+  ########################################
+  # Booking Module Lambdas
+  StartTripFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: StartTrip
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !Ref LabRoleArn
+      Environment:
+        Variables:
+          USER_NOTIFICATION_TOPIC_ARN: !Ref UserNotificationTopic
+      Code:
+        ZipFile: |
+          import json, uuid
+          from datetime import datetime
+          import boto3
+          import os
+          from decimal import Decimal
+
+          def to_decimal(val):
+              if isinstance(val, float): return Decimal(str(val))
+              if isinstance(val, list): return [to_decimal(v) for v in val]
+              if isinstance(val, dict): return {k: to_decimal(v) for k,v in val.items()}
+              return val
+
+          dynamodb = boto3.resource('dynamodb')
+          scooter_table = dynamodb.Table('Scooters')
+          trip_table = dynamodb.Table('Trips')
+          sns = boto3.client('sns')
+          TOPIC_ARN = os.environ['USER_NOTIFICATION_TOPIC_ARN']
+
+          def lambda_handler(event, context):
+              body = json.loads(event['body'])
+              scooter_id = body['scooter_id']; user_id = body['user_id']
+              scooter = scooter_table.get_item(Key={'scooter_id':scooter_id}).get('Item')
+              if not scooter or scooter['status']!='available':
+                  return {'statusCode':400,'body':json.dumps({'message':'Scooter not available'})}
+              scooter_table.update_item(
+                  Key={'scooter_id':scooter_id},
+                  UpdateExpression='SET #s = :u',
+                  ExpressionAttributeNames={'#s':'status'},
+                  ExpressionAttributeValues={':u':'in_use'}
+              )
+              trip_id = str(uuid.uuid4())
+              trip_item = to_decimal({
+                  'trip_id':trip_id,
+                  'user_id':user_id,
+                  'scooter_id':scooter_id,
+                  'start_time':datetime.utcnow().isoformat(),
+                  'start_location':body['start_location'],
+                  'status':'ongoing'
+              })
+              trip_table.put_item(Item=trip_item)
+              # publish to SNS
+              message = {'to':body['email'],'subject':'Your Dal Scooter Trip Has Started!','body':f"Your Dal Scooter trip has just started!\n\n"}
+              sns.publish(TopicArn=TOPIC_ARN, Message=json.dumps(message))
+
+              return {'statusCode':201,'body':json.dumps({'trip_id':trip_id})}
+      MemorySize: 128
+      Timeout: 10
+  
+  EndTripFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: EndTrip
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !Ref LabRoleArn
+      Environment:
+        Variables:
+          USER_NOTIFICATION_TOPIC_ARN: !Ref UserNotificationTopic
+      Code:
+        ZipFile: |
+          import json, boto3
+          from decimal import Decimal
+          from datetime import datetime
+          import os
+
+          def to_decimal(val):
+              if isinstance(val, float): return Decimal(str(val))
+              if isinstance(val, list): return [to_decimal(v) for v in val]
+              if isinstance(val, dict): return {k: to_decimal(v) for k,v in val.items()}
+              return val
+
+          dynamodb = boto3.resource('dynamodb')
+          trip_table = dynamodb.Table('Trips')
+          scooter_table = dynamodb.Table('Scooters')
+          sns = boto3.client('sns')
+          TOPIC_ARN = os.environ['USER_NOTIFICATION_TOPIC_ARN']
+
+          def calc_price(start, end):
+              minutes = (end - start).total_seconds() / 60
+              return Decimal('1') + Decimal(str(minutes * 0.25))
+
+          def lambda_handler(event, context):
+              body = json.loads(event['body'])
+              trip_id = body['trip_id']
+              end_loc = to_decimal(body['end_location'])
+
+              trip = trip_table.get_item(Key={'trip_id': trip_id}).get('Item')
+              if not trip or trip['status'] != 'ongoing':
+                  return {'statusCode':400,'body':json.dumps({'message':'Trip not active'})}
+
+              end_time = datetime.utcnow()
+              start_time = datetime.fromisoformat(trip['start_time'])
+              price = calc_price(start_time, end_time)
+
+              trip_table.update_item(
+                  Key={'trip_id': trip_id},
+                  UpdateExpression='SET end_time=:et, end_location=:el, #s=:st, price=:p',
+                  ExpressionAttributeNames={'#s':'status'},
+                  ExpressionAttributeValues={
+                      ':et': end_time.isoformat(),
+                      ':el': end_loc,
+                      ':st': 'completed',
+                      ':p': price
+                  }
+              )
+              scooter_table.update_item(
+                  Key={'scooter_id': trip['scooter_id']},
+                  UpdateExpression='SET #s=:av',
+                  ExpressionAttributeNames={'#s':'status'},
+                  ExpressionAttributeValues={':av':'available'}
+              )
+
+              # publish to SNS
+              message = {'to':body['email'],'subject':'Your Dal Scooter Trip Has Ended!','body':f"Your Dal Scooter trip has just ended!\n\n"}
+              sns.publish(TopicArn=TOPIC_ARN, Message=json.dumps(message))
+
+              return {'statusCode':200,'body':json.dumps({'price': float(price)})}
+      MemorySize: 128
+      Timeout: 10
+  
+  GetTripsByUserIdFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: GetTripsByUserId
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !Ref LabRoleArn
+      Code:
+        ZipFile: |
+          import json, decimal
+          import boto3
+          from boto3.dynamodb.conditions import Attr
+
+          table = boto3.resource('dynamodb').Table('Trips')
+
+          def json_dumps_decimal(data):
+              return json.dumps(data, default=lambda o: float(o) if isinstance(o, decimal.Decimal) else o)
+
+          def lambda_handler(event, context):
+              user_id = (event.get('pathParameters') or {}).get('user_id')
+              if not user_id:
+                  return {'statusCode':400,'body':json.dumps({'message':'user_id missing'})}
+              resp = table.scan(FilterExpression=Attr('user_id').eq(user_id))
+              return {'statusCode':200,'body':json_dumps_decimal(resp.get('Items',[]))}
+      MemorySize: 128
+      Timeout: 10
+
+  CreateScooterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: CreateScooter
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !Ref LabRoleArn
+      Code:
+        ZipFile: |
+          import json, uuid
+          import boto3
+          from decimal import Decimal
+
+          def to_decimal(val):
+              if isinstance(val, float): return Decimal(str(val))
+              if isinstance(val, list): return [to_decimal(v) for v in val]
+              if isinstance(val, dict): return {k: to_decimal(v) for k,v in val.items()}
+              return val
+
+          table = boto3.resource('dynamodb').Table('Scooters')
+
+          def lambda_handler(event, context):
+              body = json.loads(event['body'])
+              scooter_id = str(uuid.uuid4())
+              item = {
+                  'scooter_id':scooter_id,
+                  'franchise_id':body['franchise_id'],
+                  'lat':Decimal(str(body['lat'])),
+                  'long':Decimal(str(body['long'])),
+                  'status':'available',
+                  'metadata':to_decimal(body.get('metadata',{}))
+              }
+              table.put_item(Item=item)
+              return {'statusCode':201,'body':json.dumps({'scooter_id':scooter_id})}
+      MemorySize: 128
+      Timeout: 10
+
+  GetAllScootersFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: GetAllScooters
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !Ref LabRoleArn
+      Code:
+        ZipFile: |
+          import json, decimal
+          import boto3
+          from boto3.dynamodb.conditions import Attr
+
+          table = boto3.resource('dynamodb').Table('Scooters')
+
+          def lambda_handler(event, context):
+              status_filter = (event.get('queryStringParameters') or {}).get('status')
+              if status_filter:
+                  resp = table.scan(FilterExpression=Attr('status').eq(status_filter))
+              else:
+                  resp = table.scan()
+              return {'statusCode':200,'body':json.dumps(resp.get('Items',[]), default=lambda o: float(o) if isinstance(o, decimal.Decimal) else o)}
+      MemorySize: 128
+      Timeout: 10
+
+  GetScooterByIdFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: GetScooterById
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !Ref LabRoleArn
+      Code:
+        ZipFile: |
+          import json, decimal
+          import boto3
+
+          table = boto3.resource('dynamodb').Table('Scooters')
+
+          def lambda_handler(event, context):
+              scooter_id = (event.get('pathParameters') or {}).get('scooter_id')
+              if not scooter_id: return {'statusCode':400,'body':json.dumps({'message':'scooter_id missing'})}
+              res = table.get_item(Key={'scooter_id':scooter_id})
+              item = res.get('Item')
+              if not item: return {'statusCode':404,'body':json.dumps({'message':'Not found'})}
+              return {'statusCode':200,'body':json.dumps(item, default=lambda o: float(o) if isinstance(o, decimal.Decimal) else o)}
+      MemorySize: 128
+      Timeout: 10
+
+  UpdateScooterByIdFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: UpdateScooterById
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !Ref LabRoleArn
+      Code:
+        ZipFile: |
+          import json, decimal
+          from decimal import Decimal
+          import boto3
+
+          def to_decimal(val):
+              if isinstance(val, float): return Decimal(str(val))
+              if isinstance(val, list): return [to_decimal(v) for v in val]
+              if isinstance(val, dict): return {k: to_decimal(v) for k,v in val.items()}
+              return val
+
+          table = boto3.resource('dynamodb').Table('Scooters')
+
+          def lambda_handler(event, context):
+              scooter_id = (event.get('pathParameters') or {}).get('scooter_id')
+              body = json.loads(event.get('body','{}'))
+              update_parts, names, vals = [], {}, {}
+              if 'lat' in body: update_parts.append('lat = :lat'); vals[':lat']=Decimal(str(body['lat']))
+              if 'long' in body: update_parts.append('#lng = :lng'); vals[':lng']=Decimal(str(body['long'])); names['#lng']='long'
+              if 'status' in body: update_parts.append('#st = :st'); vals[':st']=body['status']; names['#st']='status'
+              if 'metadata' in body: update_parts.append('metadata = :md'); vals[':md']=to_decimal(body['metadata'])
+              if not update_parts: return {'statusCode':400,'body':json.dumps({'message':'No fields'})}
+              res = table.update_item(Key={'scooter_id':scooter_id},
+                                     UpdateExpression='SET '+','.join(update_parts),
+                                     ExpressionAttributeNames=names or None,
+                                     ExpressionAttributeValues=vals,
+                                     ReturnValues='ALL_NEW')
+              return {'statusCode':200,'body':json.dumps(res['Attributes'], default=str)}
+      MemorySize: 128
+      Timeout: 10
+
+  DeleteScooterByIdFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: DeleteScooterById
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !Ref LabRoleArn
+      Code:
+        ZipFile: |
+          import json, boto3
+          table = boto3.resource('dynamodb').Table('Scooters')
+          def lambda_handler(event, context):
+              scooter_id = (event.get('pathParameters') or {}).get('scooter_id')
+              if not scooter_id: return {'statusCode':400,'body':json.dumps({'message':'scooter_id missing'})}
+              table.delete_item(Key={'scooter_id':scooter_id})
+              return {'statusCode':200,'body':json.dumps({'message':f"Scooter {scooter_id} deleted"})}
+      MemorySize: 128
+      Timeout: 10
+
+  #Messaging Lambda
+  SendCustomerMessageFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: SendCustomerMessage
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !Ref LabRoleArn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import time
+          import uuid
+          from datetime import datetime
+
+          dynamodb = boto3.resource('dynamodb')
+          TABLE_NAME = "TripMessages"
+
+          def lambda_handler(event, context):
+              try:
+                  body = json.loads(event.get('body', '{}'))
+
+                  trip_id = body.get("trip_id")
+                  sender_id = body.get("senderId")
+                  sender_type = body.get("senderType")  # 'customer' or 'franchise'
+                  message = body.get("message")
+                  customer_name = body.get("customer_name")
+
+                  if not trip_id or not sender_id or not sender_type or not message:
+                      return {"statusCode": 400, "body": json.dumps({"error": "Missing required fields"})}
+
+                  if sender_type not in ["customer", "franchise"]:
+                      return {"statusCode": 400, "body": json.dumps({"error": "Invalid sender type"})}
+
+                  message_id = str(uuid.uuid4())
+                  timestamp = str(int(time.time()))
+
+                  message_item = {
+                      "trip_id": trip_id,
+                      "timestamp": timestamp,
+                      "message_id": message_id,
+                      "sender": sender_type,
+                      "message": message,
+                      "created_at": datetime.utcnow().isoformat()
+                  }
+
+                  if sender_type == "customer":
+                      message_item["customerId"] = sender_id
+                      if customer_name:
+                          message_item["customer_name"] = customer_name
+                  else:
+                      message_item["franchiseId"] = sender_id
+
+                  table = dynamodb.Table(TABLE_NAME)
+                  table.put_item(Item=message_item)
+
+                  return {"statusCode": 200, "body": json.dumps({"message": "Message saved to DB."})}
+
+              except Exception as e:
+                  print("Error:", str(e))
+                  return {"statusCode": 500, "body": json.dumps({"error": str(e)})}
+      MemorySize: 128
+      Timeout: 10
+
+  AcceptPendingChatRequestFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: AcceptPendingChatRequest
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !Ref LabRoleArn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          from datetime import datetime
+
+          dynamodb = boto3.resource('dynamodb')
+          TABLE_NAME = "PendingChatRequests"
+
+          def lambda_handler(event, context):
+              try:
+                  body = json.loads(event.get('body', '{}'))
+                  trip_id = body.get('trip_id')
+                  created_at = body.get('created_at')
+                  franchise_id = body.get('franchise_id')
+
+                  if not trip_id or not franchise_id:
+                      return {"statusCode": 400, "body": json.dumps({"error": "Missing trip_id or franchise_id"})}
+
+                  table = dynamodb.Table(TABLE_NAME)
+                  response = table.update_item(
+                      Key={"trip_id": trip_id, "created_at": created_at},
+                      UpdateExpression="SET #s = :s, assigned_franchise_id = :f, accepted_at = :t",
+                      ExpressionAttributeNames={"#s": "status"},
+                      ExpressionAttributeValues={
+                          ":s": "accepted",
+                          ":f": franchise_id,
+                          ":t": datetime.utcnow().isoformat()
+                      },
+                      ReturnValues="UPDATED_NEW"
+                  )
+
+                  return {"statusCode": 200, "body": json.dumps({"message": "Chat request accepted", "updated": response.get('Attributes')})}
+
+              except Exception as e:
+                  return {"statusCode": 500, "body": json.dumps({"error": str(e)})}
+      MemorySize: 128
+      Timeout: 10
+
+  GetAcceptedChatsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: GetAcceptedChats
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !Ref LabRoleArn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          from boto3.dynamodb.conditions import Attr
+
+          dynamodb = boto3.resource('dynamodb')
+          TABLE_NAME = "PendingChatRequests"
+
+          def lambda_handler(event, context):
+              try:
+                  table = dynamodb.Table(TABLE_NAME)
+                  franchise_id = event.get('queryStringParameters', {}).get('franchise_id')
+                  response = table.scan()
+                  items = response.get('Items', [])
+                  filtered = [item for item in items if item.get('status') == 'accepted' and item.get('assigned_franchise_id') == franchise_id]
+                  return {"statusCode": 200, "body": json.dumps(filtered)}
+
+              except Exception as e:
+                  return {"statusCode": 500, "body": json.dumps({"error": str(e)})}
+      MemorySize: 128
+      Timeout: 10
+
+  GetPendingChatRequestsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: GetPendingChatRequests
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !Ref LabRoleArn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          from boto3.dynamodb.conditions import Attr
+
+          dynamodb = boto3.resource('dynamodb')
+          TABLE_NAME = "PendingChatRequests"
+
+          def lambda_handler(event, context):
+              try:
+                  table = dynamodb.Table(TABLE_NAME)
+                  response = table.scan(FilterExpression=Attr('status').eq('pending'))
+                  items = response.get('Items', [])
+                  return {"statusCode": 200, "body": json.dumps(items)}
+
+              except Exception as e:
+                  return {"statusCode": 500, "body": json.dumps({"error": str(e)})}
+      MemorySize: 128
+      Timeout: 10
+
+  CreatePendingChatRequestFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: CreatePendingChatRequest
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !Ref LabRoleArn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from datetime import datetime
+          from boto3.dynamodb.conditions import Key
+
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table('PendingChatRequests')
+
+          def lambda_handler(event, context):
+              try:
+                  body = json.loads(event.get('body', '{}'))
+                  trip_id = body.get('trip_id')
+                  customer_id = body.get('customer_id')
+                  customer_name = body.get('customer_name')
+                  message = body.get('message')
+
+                  if not trip_id or not customer_id or not message:
+                      return {"statusCode": 400, "body": json.dumps({"error": "Missing required fields"})}
+
+                  response = table.query(KeyConditionExpression=Key('trip_id').eq(trip_id))
+                  if response.get('Count', 0) > 0:
+                      return {"statusCode": 200, "body": json.dumps({"message": "Trip ID already exists. Not saving again."})}
+
+                  item = {
+                      'trip_id': trip_id,
+                      'created_at': datetime.utcnow().isoformat(),
+                      'status': 'pending',
+                      'customer_id': customer_id,
+                      'customer_name': customer_name,
+                      'message_preview': message[:100]
+                  }
+                  table.put_item(Item=item)
+                  return {"statusCode": 200, "body": json.dumps({"message": "Pending chat request saved successfully."})}
+
+              except Exception as e:
+                  print("Error:", str(e))
+                  return {"statusCode": 500, "body": json.dumps({"error": str(e)})}
+      MemorySize: 128
+      Timeout: 10
+
+  GetMessagesByTripFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: GetMessagesByTrip
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !Ref LabRoleArn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          from boto3.dynamodb.conditions import Key
+
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table('TripMessages')
+
+          def lambda_handler(event, context):
+              trip_id = event['pathParameters']['trip_id']
+              try:
+                  response = table.query(KeyConditionExpression=Key('trip_id').eq(trip_id), ScanIndexForward=True)
+                  messages = response.get('Items', [])
+                  return {'statusCode': 200, 'headers': {'Access-Control-Allow-Origin': '*'}, 'body': json.dumps(messages)}
+              except Exception as e:
+                  return {'statusCode': 500, 'headers': {'Access-Control-Allow-Origin': '*'}, 'body': json.dumps({'error': str(e)})}
+      MemorySize: 128
+      Timeout: 10
+
+  # Feedback Module lambdas
+  SubmitFeedbackFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: SubmitFeedback
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !Ref LabRoleArn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          import urllib3
+          from datetime import datetime
+          from decimal import Decimal
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
+          FEEDBACKS_TABLE = dynamodb.Table('Feedbacks')
+          HUGGING_FACE_API_URL = "https://api-inference.huggingface.co/models/cardiffnlp/twitter-roberta-base-sentiment-latest"
+
+          def lambda_handler(event, context):
+              
+              try:
+                  logger.info(f"Received event: {json.dumps(event)}")
+                  
+                  # Get request body
+                  if event.get('body'):
+                      if isinstance(event['body'], str):
+                          body = json.loads(event['body'])
+                      else:
+                          body = event['body']
+                  else:
+                      return create_response(400, {'error': 'Request body is required'})
+                  
+                  logger.info(f"Parsed request body: {body}")
+                  
+                  # Check all required fields are present
+                  required_fields = ['user_id', 'trip_id', 'scooter_type', 'rating', 'comment']
+                  for field in required_fields:
+                      if field not in body or not body[field]:
+                          return create_response(400, {'error': f'{field} is required'})
+                  
+                  user_id = body['user_id']
+                  trip_id = body['trip_id']
+                  scooter_type = body['scooter_type']
+                  rating = int(body['rating'])
+                  comment = body['comment'].strip()
+                  
+                  logger.info(f"Processing feedback: user={user_id[:8]}..., trip={trip_id[:8]}..., type={scooter_type}, rating={rating}")
+                  
+                  # Basic validation checks
+                  if not (1 <= rating <= 5):
+                      return create_response(400, {'error': 'Rating must be between 1 and 5'})
+                  
+                  # Check scooter type is valid
+                  valid_scooter_types = ['gyroscooter', 'eBike', 'segway']
+                  if scooter_type not in valid_scooter_types:
+                      return create_response(400, {'error': f'Invalid scooter_type. Must be one of: {valid_scooter_types}'})
+                  
+                  # Make sure comment isn't too short
+                  if len(comment) < 3:
+                      return create_response(400, {'error': 'Comment must be at least 3 characters long'})
+                  
+                  # Create unique ID and timestamp
+                  feedback_id = f"fb_{str(uuid.uuid4())[:8]}"
+                  current_time = datetime.utcnow().isoformat() + 'Z'
+                  
+                  logger.info(f"Generated feedback ID: {feedback_id}")
+                  
+                  # Get sentiment from Hugging Face API
+                  sentiment_result = analyze_sentiment_huggingface(comment)
+                  logger.info(f"Hugging Face sentiment analysis result: {sentiment_result}")
+                  
+                  # Build DynamoDB record
+                  feedback_item = {
+                      'feedback_id': feedback_id,
+                      'user_id': user_id,
+                      'trip_id': trip_id,
+                      'scooter_type': scooter_type,
+                      'rating': rating,
+                      'comment': comment,
+                      'sentiment': sentiment_result['sentiment'],
+                      'sentiment_score': Decimal(str(sentiment_result['confidence'])),
+                      'created_at': current_time,
+                      'updated_at': current_time,
+                      'is_deleted': False
+                  }
+                  
+                  logger.info(f"Storing feedback in DynamoDB: {feedback_id}")
+                  
+                  # Save to database
+                  FEEDBACKS_TABLE.put_item(Item=feedback_item)
+                  
+                  logger.info(f"Feedback submitted successfully: {feedback_id}")
+                  
+                  # Send back response
+                  response_data = {
+                      'message': 'Feedback submitted successfully',
+                      'feedback_id': feedback_id,
+                      'sentiment': sentiment_result['sentiment'],
+                      'sentiment_score': float(sentiment_result['confidence']),
+                      'created_at': current_time
+                  }
+                  
+                  return create_response(201, response_data)
+                  
+              except ValueError as e:
+                  logger.error(f"Validation error: {str(e)}")
+                  return create_response(400, {'error': f'Validation error: {str(e)}'})
+              
+              except Exception as e:
+                  logger.error(f"Error submitting feedback: {str(e)}")
+                  import traceback
+                  logger.error(f"Traceback: {traceback.format_exc()}")
+                  return create_response(500, {'error': 'Internal server error'})
+
+          def analyze_sentiment_huggingface(comment):
+              # Call Hugging Face free API for sentiment analysis
+              try:
+                  logger.info(f"Analyzing sentiment with Hugging Face for: {comment[:100]}...")
+                  
+                  # Set up request data
+                  payload = {
+                      "inputs": comment,
+                      "options": {
+                          "wait_for_model": True
+                      }
+                  }
+                  
+                  # Make HTTP request
+                  http = urllib3.PoolManager()
+                  
+                  # Send request to Hugging Face
+                  response = http.request(
+                      'POST',
+                      HUGGING_FACE_API_URL,
+                      body=json.dumps(payload),
+                      headers={
+                          'Content-Type': 'application/json',
+                      },
+                      timeout=10.0
+                  )
+                  
+                  logger.info(f"Hugging Face API response status: {response.status}")
+                  
+                  if response.status == 200:
+                      # Parse the response
+                      result = json.loads(response.data.decode('utf-8'))
+                      logger.info(f"Hugging Face API raw response: {result}")
+                      
+                      if isinstance(result, list) and len(result) > 0:
+                          # Extract sentiment predictions
+                          predictions = result[0] if isinstance(result[0], list) else result
+                          
+                          # Find the prediction with highest confidence
+                          best_prediction = max(predictions, key=lambda x: x['score'])
+                          
+                          # Map Hugging Face labels to our format
+                          label_mapping = {
+                              'LABEL_0': 'negative',    # RoBERTa negative
+                              'LABEL_1': 'neutral',     # RoBERTa neutral  
+                              'LABEL_2': 'positive',    # RoBERTa positive
+                              'NEGATIVE': 'negative',
+                              'NEUTRAL': 'neutral',
+                              'POSITIVE': 'positive'
+                          }
+                          
+                          raw_label = best_prediction['label']
+                          sentiment = label_mapping.get(raw_label.upper(), 'neutral')
+                          confidence = round(best_prediction['score'], 3)
+                          
+                          logger.info(f"Mapped sentiment: {sentiment} (confidence: {confidence})")
+                          
+                          return {
+                              'sentiment': sentiment,
+                              'confidence': confidence,
+                              'raw_label': raw_label,
+                              'api_source': 'huggingface'
+                          }
+                      else:
+                          logger.warning("Unexpected Hugging Face API response format")
+                          return fallback_sentiment_analysis(comment)
+                  
+                  elif response.status == 503:
+                      # Model is loading, wait and retry once
+                      logger.info("Model is loading, retrying in 3 seconds...")
+                      import time
+                      time.sleep(3)
+                      
+                      # Retry the request
+                      retry_response = http.request(
+                          'POST',
+                          HUGGING_FACE_API_URL,
+                          body=json.dumps(payload),
+                          headers={
+                              'Content-Type': 'application/json',
+                          },
+                          timeout=15.0
+                      )
+                      
+                      if retry_response.status == 200:
+                          result = json.loads(retry_response.data.decode('utf-8'))
+                          predictions = result[0] if isinstance(result[0], list) else result
+                          best_prediction = max(predictions, key=lambda x: x['score'])
+                          
+                          label_mapping = {
+                              'LABEL_0': 'negative',
+                              'LABEL_1': 'neutral', 
+                              'LABEL_2': 'positive',
+                              'NEGATIVE': 'negative',
+                              'NEUTRAL': 'neutral',
+                              'POSITIVE': 'positive'
+                          }
+                          
+                          sentiment = label_mapping.get(best_prediction['label'].upper(), 'neutral')
+                          confidence = round(best_prediction['score'], 3)
+                          
+                          return {
+                              'sentiment': sentiment,
+                              'confidence': confidence,
+                              'raw_label': best_prediction['label'],
+                              'api_source': 'huggingface_retry'
+                          }
+                      else:
+                          logger.warning(f"Retry failed with status: {retry_response.status}")
+                          return fallback_sentiment_analysis(comment)
+                  
+                  else:
+                      logger.error(f"Hugging Face API error: {response.status} - {response.data.decode('utf-8')}")
+                      return fallback_sentiment_analysis(comment)
+                      
+              except Exception as e:
+                  logger.error(f"Hugging Face API request failed: {str(e)}")
+                  return fallback_sentiment_analysis(comment)
+
+          def fallback_sentiment_analysis(comment):
+              
+              # Enhanced fallback sentiment analysis when Hugging Face API fails
+              
+              try:
+                  logger.info("Using fallback sentiment analysis")
+                  comment_lower = comment.lower()
+                  
+                  # Enhanced sentiment word lists
+                  positive_words = [
+                      # Very positive
+                      'amazing', 'excellent', 'fantastic', 'wonderful', 'awesome', 'perfect', 
+                      'outstanding', 'superb', 'brilliant', 'exceptional', 'incredible',
+                      # Positive
+                      'great', 'good', 'nice', 'smooth', 'comfortable', 'easy', 'fast', 
+                      'reliable', 'convenient', 'satisfied', 'happy', 'pleased', 'impressed',
+                      'enjoyed', 'love', 'recommend', 'efficient', 'responsive', 'stable',
+                      'clean', 'quiet', 'powerful', 'fun', 'beautiful', 'helpful', 'useful',
+                      # Experience words
+                      'seamless', 'flawless', 'sturdy', 'durable', 'affordable', 'worth'
+                  ]
+                  
+                  negative_words = [
+                      # Very negative
+                      'terrible', 'awful', 'horrible', 'disgusting', 'pathetic', 'worst',
+                      'hate', 'unacceptable', 'defective', 'useless', 'worthless',
+                      # Negative
+                      'bad', 'poor', 'broken', 'slow', 'uncomfortable', 'difficult', 
+                      'problem', 'issue', 'failed', 'disappointed', 'frustrating', 
+                      'annoying', 'unreliable', 'dangerous', 'expensive', 'waste',
+                      'regret', 'complain', 'faulty', 'unstable', 'confusing'
+                  ]
+                  
+                  # Count sentiment words
+                  pos_count = sum(1 for word in positive_words if word in comment_lower)
+                  neg_count = sum(1 for word in negative_words if word in comment_lower)
+                  
+                  # Check for negation patterns
+                  negation_patterns = ['not ', 'no ', 'never ', "don't ", "doesn't ", "didn't ", "won't ", "wouldn't "]
+                  has_negation = any(pattern in comment_lower for pattern in negation_patterns)
+                  
+                  # Check for intensifiers
+                  intensifiers = ['very', 'really', 'extremely', 'absolutely', 'totally', 'completely']
+                  has_intensifier = any(word in comment_lower for word in intensifiers)
+                  
+                  # Check for punctuation emphasis
+                  exclamation_count = comment.count('!')
+                  
+                  # Calculate sentiment
+                  if pos_count > neg_count:
+                      base_confidence = 0.7
+                      if has_intensifier:
+                          base_confidence += 0.1
+                      if exclamation_count > 0:
+                          base_confidence += 0.05
+                      if has_negation:
+                          # Flip to negative if strong negation
+                          return {
+                              'sentiment': 'negative',
+                              'confidence': round(min(base_confidence * 0.8, 0.85), 3),
+                              'api_source': 'fallback_negated'
+                          }
+                      return {
+                          'sentiment': 'positive',
+                          'confidence': round(min(base_confidence, 0.9), 3),
+                          'api_source': 'fallback'
+                      }
+                  elif neg_count > pos_count:
+                      base_confidence = 0.7
+                      if has_intensifier:
+                          base_confidence += 0.1
+                      return {
+                          'sentiment': 'negative',
+                          'confidence': round(min(base_confidence, 0.9), 3),
+                          'api_source': 'fallback'
+                      }
+                  else:
+                      return {
+                          'sentiment': 'neutral',
+                          'confidence': 0.6,
+                          'api_source': 'fallback'
+                      }
+                      
+              except Exception as e:
+                  logger.error(f"Fallback sentiment analysis failed: {str(e)}")
+                  return {
+                      'sentiment': 'neutral',
+                      'confidence': 0.5,
+                      'api_source': 'fallback_error'
+                  }
+
+          def create_response(status_code, body):
+              
+              # Create standardized API response
+              
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+                      'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+                  },
+                  'body': json.dumps(body, default=str)
+              }
+      MemorySize: 128
+      Timeout: 30
+
+  GetFeedbacksPublicFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: GetFeedbacksPublic
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !Ref LabRoleArn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from boto3.dynamodb.conditions import Attr
+          from decimal import Decimal
+          import logging
+          from datetime import datetime
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Initialize DynamoDB
+          dynamodb = boto3.resource('dynamodb')
+          FEEDBACKS_TABLE = dynamodb.Table('Feedbacks')
+
+          def lambda_handler(event, context):
+              # Get public feedbacks Lambda function for guest users
+              # Supports query parameters: scooter_type, sentiment, rating, limit
+              # No authorization required - returns limited data for privacy
+              
+              try:
+                  # Extract query parameters
+                  query_params = event.get('queryStringParameters') or {}
+                  
+                  scooter_type_filter = query_params.get('scooter_type')
+                  sentiment_filter = query_params.get('sentiment')
+                  rating_filter = query_params.get('rating')
+                  limit = int(query_params.get('limit', 20))  # Default limit of 20 for guests
+                  
+                  # Validate limit (lower limit for guests)
+                  if limit > 50:
+                      limit = 50  # Maximum limit of 50 for guests
+                  
+                  # Build scan parameters
+                  scan_params = {
+                      'FilterExpression': Attr('is_deleted').eq(False),
+                      'Limit': limit
+                  }
+                  
+                  # Add filters
+                  filter_expressions = [Attr('is_deleted').eq(False)]
+                  
+                  if scooter_type_filter:
+                      valid_types = ['gyroscooter', 'eBike', 'segway']
+                      if scooter_type_filter in valid_types:
+                          filter_expressions.append(Attr('scooter_type').eq(scooter_type_filter))
+                  
+                  if sentiment_filter:
+                      valid_sentiments = ['positive', 'negative', 'neutral', 'mixed']
+                      if sentiment_filter in valid_sentiments:
+                          filter_expressions.append(Attr('sentiment').eq(sentiment_filter))
+                  
+                  if rating_filter:
+                      try:
+                          rating_value = int(rating_filter)
+                          if 1 <= rating_value <= 5:
+                              filter_expressions.append(Attr('rating').eq(rating_value))
+                      except ValueError:
+                          pass
+                  
+                  # Combine all filter expressions
+                  if len(filter_expressions) > 1:
+                      combined_filter = filter_expressions[0]
+                      for expr in filter_expressions[1:]:
+                          combined_filter = combined_filter & expr
+                      scan_params['FilterExpression'] = combined_filter
+                  
+                  # Perform scan
+                  response = FEEDBACKS_TABLE.scan(**scan_params)
+                  
+                  # Process items - remove sensitive data for guest users
+                  items = response.get('Items', [])
+                  processed_items = []
+                  
+                  for item in items:
+                      # Only include non-sensitive data for guest users
+                      processed_item = {
+                          'scooter_type': item['scooter_type'],
+                          'rating': int(item['rating']),
+                          'comment': item['comment'],
+                          'sentiment': item['sentiment'],
+                          'created_date': extract_date_only(item['created_at']),  # Date only, no timestamp
+                          'sentiment_indicator': get_sentiment_indicator(item['sentiment'])  # User-friendly indicator
+                      }
+                      processed_items.append(processed_item)
+                  
+                  # Sort by created_date (most recent first) but limit to date granularity
+                  processed_items.sort(key=lambda x: x['created_date'], reverse=True)
+                  
+                  # Calculate some basic statistics for guests
+                  statistics = calculate_public_statistics(processed_items)
+                  
+                  # Prepare response
+                  response_data = {
+                      'feedbacks': processed_items,
+                      'count': len(processed_items),
+                      'statistics': statistics,
+                      'filters_applied': {
+                          'scooter_type': scooter_type_filter,
+                          'sentiment': sentiment_filter,
+                          'rating': rating_filter
+                      },
+                      'message': 'Public feedback data - limited information for privacy'
+                  }
+                  
+                  logger.info(f"Retrieved {len(processed_items)} public feedbacks for guest user")
+                  
+                  return create_response(200, response_data)
+                  
+              except Exception as e:
+                  logger.error(f"Error retrieving public feedbacks: {str(e)}")
+                  return create_response(500, {'error': 'Unable to retrieve feedback data'})
+
+          def extract_date_only(created_at_timestamp):
+              # Extract just the date from timestamp for privacy
+              try:
+                  # Parse the ISO timestamp and return only the date part
+                  dt = datetime.fromisoformat(created_at_timestamp.replace('Z', '+00:00'))
+                  return dt.strftime('%Y-%m-%d')
+              except:
+                  return 'Unknown'
+
+          def get_sentiment_indicator(sentiment):
+              # Convert sentiment to user-friendly indicator
+              indicators = {
+                  'positive': '😊 Positive',
+                  'negative': '😞 Negative', 
+                  'neutral': '😐 Neutral',
+                  'mixed': '🤔 Mixed'
+              }
+              return indicators.get(sentiment, '😐 Neutral')
+
+          def calculate_public_statistics(feedbacks):
+              # Calculate basic statistics for public display
+              if not feedbacks:
+                  return {
+                      'total_feedbacks': 0,
+                      'average_rating': 0,
+                      'sentiment_breakdown': {}
+                  }
+              
+              # Calculate average rating
+              ratings = [f['rating'] for f in feedbacks]
+              avg_rating = round(sum(ratings) / len(ratings), 1) if ratings else 0
+              
+              # Calculate sentiment breakdown
+              sentiments = [f['sentiment'] for f in feedbacks]
+              sentiment_counts = {}
+              for sentiment in ['positive', 'negative', 'neutral', 'mixed']:
+                  count = sentiments.count(sentiment)
+                  sentiment_counts[sentiment] = {
+                      'count': count,
+                      'percentage': round((count / len(feedbacks)) * 100, 1) if feedbacks else 0
+                  }
+              
+              # Calculate scooter type breakdown
+              scooter_types = [f['scooter_type'] for f in feedbacks]
+              scooter_type_counts = {}
+              for scooter_type in ['gyroscooter', 'eBike', 'segway']:
+                  count = scooter_types.count(scooter_type)
+                  if count > 0:
+                      type_feedbacks = [f for f in feedbacks if f['scooter_type'] == scooter_type]
+                      type_ratings = [f['rating'] for f in type_feedbacks]
+                      avg_type_rating = round(sum(type_ratings) / len(type_ratings), 1) if type_ratings else 0
+                      
+                      scooter_type_counts[scooter_type] = {
+                          'count': count,
+                          'average_rating': avg_type_rating,
+                          'percentage': round((count / len(feedbacks)) * 100, 1)
+                      }
+              
+              return {
+                  'total_feedbacks': len(feedbacks),
+                  'average_rating': avg_rating,
+                  'sentiment_breakdown': sentiment_counts,
+                  'scooter_type_breakdown': scooter_type_counts,
+                  'rating_distribution': calculate_rating_distribution(ratings)
+              }
+
+          def calculate_rating_distribution(ratings):
+              # Calculate distribution of ratings
+              distribution = {}
+              for rating in range(1, 6):
+                  count = ratings.count(rating)
+                  distribution[str(rating)] = {
+                      'count': count,
+                      'percentage': round((count / len(ratings)) * 100, 1) if ratings else 0
+                  }
+              return distribution
+
+          def create_response(status_code, body):
+              # Create standardized API response with CORS for public access
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',  # Allow from any origin for public access
+                      'Access-Control-Allow-Methods': 'GET, OPTIONS',
+                      'Access-Control-Allow-Headers': 'Content-Type',
+                      'Cache-Control': 'public, max-age=300'  # Cache for 5 minutes
+                  },
+                  'body': json.dumps(body, default=str)
+              }
+      MemorySize: 128
+      Timeout: 30
+
+  GetFeedbacksByIdFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: GetFeedbacksById
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !Ref LabRoleArn
+      Code:
+        ZipFile: |
+          # ===================================================================
+          # GET SCOOTER FEEDBACKS LAMBDA FUNCTION
+          # File: get_scooter_feedbacks.py
+          # API Endpoint: GET /scooters/{scooter_id}/feedbacks
+          # ===================================================================
+
+          import json
+          import boto3
+          from boto3.dynamodb.conditions import Attr, Key
+          import logging
+          from decimal import Decimal
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Initialize DynamoDB
+          dynamodb = boto3.resource('dynamodb')
+          FEEDBACKS_TABLE = dynamodb.Table('Feedbacks')
+          TRIPS_TABLE = dynamodb.Table('Trips')
+
+          def lambda_handler(event, context):
+              """
+              Get feedbacks for a specific scooter by scooter_id
+              This requires joining data from Trips and Feedbacks tables
+              """
+              
+              try:
+                  # Extract scooter_id from path parameters
+                  path_parameters = event.get('pathParameters') or {}
+                  scooter_id = path_parameters.get('scooter_id')
+                  
+                  if not scooter_id:
+                      return create_response(400, {'error': 'scooter_id path parameter is required'})
+                  
+                  # Extract query parameters
+                  query_params = event.get('queryStringParameters') or {}
+                  limit = int(query_params.get('limit', 20))  # Default limit of 20
+                  
+                  # Step 1: Get all trips for this scooter
+                  trips_response = TRIPS_TABLE.scan(
+                      FilterExpression=Attr('scooter_id').eq(scooter_id)
+                  )
+                  
+                  trip_ids = [trip['trip_id'] for trip in trips_response['Items']]
+                  
+                  if not trip_ids:
+                      return create_response(200, {
+                          'scooter_id': scooter_id,
+                          'feedbacks': [],
+                          'count': 0,
+                          'average_rating': 0,
+                          'rating_distribution': {
+                              '1': 0, '2': 0, '3': 0, '4': 0, '5': 0
+                          }
+                      })
+                  
+                  # Step 2: Get feedbacks for these trips
+                  all_feedbacks = []
+                  
+                  # Since DynamoDB doesn't support IN queries with scan, we need to batch the requests
+                  # For simplicity, we'll scan all feedbacks and filter client-side
+                  # In production, you might want to optimize this with GSI or better data structure
+                  
+                  feedbacks_response = FEEDBACKS_TABLE.scan(
+                      FilterExpression=Attr('is_deleted').eq(False)
+                  )
+                  
+                  # Filter feedbacks that match our trip_ids
+                  trip_ids_set = set(trip_ids)
+                  scooter_feedbacks = [
+                      feedback for feedback in feedbacks_response['Items']
+                      if feedback.get('trip_id') in trip_ids_set
+                  ]
+                  
+                  # Sort by created_at (most recent first) and limit
+                  scooter_feedbacks.sort(key=lambda x: x['created_at'], reverse=True)
+                  limited_feedbacks = scooter_feedbacks[:limit]
+                  
+                  # Process feedbacks for response
+                  processed_feedbacks = []
+                  for feedback in limited_feedbacks:
+                      processed_feedback = {
+                          'feedback_id': feedback['feedback_id'],
+                          'user_id': feedback['user_id'],
+                          'trip_id': feedback['trip_id'],
+                          'rating': int(feedback['rating']),
+                          'comment': feedback['comment'],
+                          'sentiment': feedback['sentiment'],
+                          'sentiment_score': float(feedback['sentiment_score']),
+                          'created_at': feedback['created_at']
+                      }
+                      processed_feedbacks.append(processed_feedback)
+                  
+                  # Calculate statistics
+                  if scooter_feedbacks:
+                      ratings = [int(f['rating']) for f in scooter_feedbacks]
+                      average_rating = sum(ratings) / len(ratings)
+                      
+                      # Rating distribution
+                      rating_distribution = {'1': 0, '2': 0, '3': 0, '4': 0, '5': 0}
+                      for rating in ratings:
+                          rating_distribution[str(rating)] += 1
+                      
+                      # Sentiment distribution
+                      sentiments = [f['sentiment'] for f in scooter_feedbacks]
+                      sentiment_counts = {}
+                      for sentiment in sentiments:
+                          sentiment_counts[sentiment] = sentiment_counts.get(sentiment, 0) + 1
+                          
+                  else:
+                      average_rating = 0
+                      rating_distribution = {'1': 0, '2': 0, '3': 0, '4': 0, '5': 0}
+                      sentiment_counts = {}
+                  
+                  response_data = {
+                      'scooter_id': scooter_id,
+                      'feedbacks': processed_feedbacks,
+                      'count': len(scooter_feedbacks),
+                      'average_rating': round(average_rating, 2) if scooter_feedbacks else 0,
+                      'rating_distribution': rating_distribution,
+                      'sentiment_distribution': sentiment_counts,
+                      'total_trips': len(trip_ids)
+                  }
+                  
+                  logger.info(f"Retrieved {len(processed_feedbacks)} feedbacks for scooter: {scooter_id}")
+                  
+                  return create_response(200, response_data)
+                  
+              except Exception as e:
+                  logger.error(f"Error retrieving scooter feedbacks: {str(e)}")
+                  return create_response(500, {'error': 'Internal server error'})
+
+          def create_response(status_code, body):
+              """
+              Create standardized API response
+              """
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+                      'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+                  },
+                  'body': json.dumps(body, default=str)
+              }
+      MemorySize: 128
+      Timeout: 30
+
+  GetFeedbacksFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: GetFeedbacks
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !Ref LabRoleArn
+      Code:
+        ZipFile: |
+          # ===================================================================
+          # 2. GET FEEDBACKS LAMBDA FUNCTION
+          # File: get_feedbacks.py
+          # API Endpoint: GET /feedbacks
+          # ===================================================================
+
+          import json
+          import boto3
+          from boto3.dynamodb.conditions import Key, Attr
+          from decimal import Decimal
+          import logging
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Initialize DynamoDB
+          dynamodb = boto3.resource('dynamodb')
+          FEEDBACKS_TABLE = dynamodb.Table('Feedbacks')
+
+          def lambda_handler(event, context):
+              """
+              Get feedbacks Lambda function
+              Supports query parameters: scooter_type, sentiment, rating, limit, last_key
+              """
+              
+              try:
+                  # Extract query parameters
+                  query_params = event.get('queryStringParameters') or {}
+                  
+                  scooter_type_filter = query_params.get('scooter_type')
+                  sentiment_filter = query_params.get('sentiment')
+                  rating_filter = query_params.get('rating')
+                  limit = int(query_params.get('limit', 50))  # Default limit of 50
+                  last_key = query_params.get('last_key')
+                  
+                  # Validate limit
+                  if limit > 100:
+                      limit = 100  # Maximum limit of 100
+                  
+                  # Build scan parameters
+                  scan_params = {
+                      'FilterExpression': Attr('is_deleted').eq(False),
+                      'Limit': limit
+                  }
+                  
+                  # Add filters
+                  filter_expressions = [Attr('is_deleted').eq(False)]
+                  
+                  if scooter_type_filter:
+                      valid_types = ['gyroscooter', 'eBike', 'segway']
+                      if scooter_type_filter in valid_types:
+                          filter_expressions.append(Attr('scooter_type').eq(scooter_type_filter))
+                  
+                  if sentiment_filter:
+                      valid_sentiments = ['positive', 'negative', 'neutral', 'mixed']
+                      if sentiment_filter in valid_sentiments:
+                          filter_expressions.append(Attr('sentiment').eq(sentiment_filter))
+                  
+                  if rating_filter:
+                      try:
+                          rating_value = int(rating_filter)
+                          if 1 <= rating_value <= 5:
+                              filter_expressions.append(Attr('rating').eq(rating_value))
+                      except ValueError:
+                          pass
+                  
+                  # Combine all filter expressions
+                  if len(filter_expressions) > 1:
+                      combined_filter = filter_expressions[0]
+                      for expr in filter_expressions[1:]:
+                          combined_filter = combined_filter & expr
+                      scan_params['FilterExpression'] = combined_filter
+                  
+                  # Handle pagination
+                  if last_key:
+                      try:
+                          scan_params['ExclusiveStartKey'] = json.loads(last_key)
+                      except (json.JSONDecodeError, TypeError):
+                          logger.warning("Invalid last_key parameter")
+                  
+                  # Perform scan
+                  response = FEEDBACKS_TABLE.scan(**scan_params)
+                  
+                  # Process items
+                  items = response.get('Items', [])
+                  processed_items = []
+                  
+                  for item in items:
+                      processed_item = {
+                          'feedback_id': item['feedback_id'],
+                          'user_id': item['user_id'],
+                          'trip_id': item['trip_id'],
+                          'scooter_type': item['scooter_type'],
+                          'rating': int(item['rating']),
+                          'comment': item['comment'],
+                          'sentiment': item['sentiment'],
+                          'sentiment_score': float(item['sentiment_score']),
+                          'created_at': item['created_at'],
+                          'updated_at': item['updated_at']
+                      }
+                      processed_items.append(processed_item)
+                  
+                  # Sort by created_at (most recent first)
+                  processed_items.sort(key=lambda x: x['created_at'], reverse=True)
+                  
+                  # Prepare response
+                  response_data = {
+                      'feedbacks': processed_items,
+                      'count': len(processed_items),
+                      'total_scanned': response.get('ScannedCount', 0)
+                  }
+                  
+                  # Add pagination info
+                  if 'LastEvaluatedKey' in response:
+                      response_data['last_key'] = json.dumps(response['LastEvaluatedKey'], default=str)
+                      response_data['has_more'] = True
+                  else:
+                      response_data['has_more'] = False
+                  
+                  logger.info(f"Retrieved {len(processed_items)} feedbacks")
+                  
+                  return create_response(200, response_data)
+                  
+              except Exception as e:
+                  logger.error(f"Error retrieving feedbacks: {str(e)}")
+                  return create_response(500, {'error': 'Internal server error'})
+
+          def create_response(status_code, body):
+              """
+              Create standardized API response
+              """
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+                      'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+                  },
+                  'body': json.dumps(body, default=str)
+              }
+
+      MemorySize: 128
+      Timeout: 30
+
+  GetFeedbackAnalyticsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: GetFeedbackAnalytics
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !Ref LabRoleArn
+      Code:
+        ZipFile: |
+          # ===================================================================
+          # 3. GET FEEDBACK ANALYTICS LAMBDA FUNCTION
+          # File: get_feedback_analytics.py
+          # API Endpoint: GET /feedbacks/analytics
+          # ===================================================================
+
+          import json
+          import boto3
+          from boto3.dynamodb.conditions import Attr
+          from collections import Counter
+          from decimal import Decimal
+          import logging
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Initialize DynamoDB
+          dynamodb = boto3.resource('dynamodb')
+          FEEDBACKS_TABLE = dynamodb.Table('Feedbacks')
+
+          def lambda_handler(event, context):
+              """
+              Get feedback analytics Lambda function
+              Returns aggregated statistics for dashboards
+              """
+              
+              try:
+                  # Scan all active feedbacks
+                  response = FEEDBACKS_TABLE.scan(
+                      FilterExpression=Attr('is_deleted').eq(False)
+                  )
+                  
+                  items = response.get('Items', [])
+                  
+                  if not items:
+                      return create_response(200, {
+                          'total_feedbacks': 0,
+                          'sentiment_distribution': {},
+                          'rating_distribution': {},
+                          'scooter_type_stats': {},
+                          'average_rating': 0,
+                          'average_sentiment_score': 0
+                      })
+                  
+                  # Calculate analytics
+                  analytics = calculate_analytics(items)
+                  
+                  logger.info(f"Generated analytics for {len(items)} feedbacks")
+                  
+                  return create_response(200, analytics)
+                  
+              except Exception as e:
+                  logger.error(f"Error generating analytics: {str(e)}")
+                  return create_response(500, {'error': 'Internal server error'})
+
+          def calculate_analytics(feedbacks):
+              """
+              Calculate comprehensive feedback analytics
+              """
+              total_feedbacks = len(feedbacks)
+              
+              # Extract data for analysis
+              sentiments = [f['sentiment'] for f in feedbacks]
+              ratings = [int(f['rating']) for f in feedbacks]
+              scooter_types = [f['scooter_type'] for f in feedbacks]
+              sentiment_scores = [float(f['sentiment_score']) for f in feedbacks]
+              
+              # Sentiment distribution
+              sentiment_counts = Counter(sentiments)
+              sentiment_distribution = {
+                  'positive': sentiment_counts.get('positive', 0),
+                  'negative': sentiment_counts.get('negative', 0),
+                  'neutral': sentiment_counts.get('neutral', 0),
+                  'mixed': sentiment_counts.get('mixed', 0)
+              }
+              
+              # Convert to percentages
+              sentiment_percentages = {}
+              for sentiment, count in sentiment_distribution.items():
+                  sentiment_percentages[sentiment] = {
+                      'count': count,
+                      'percentage': round((count / total_feedbacks) * 100, 1) if total_feedbacks > 0 else 0
+                  }
+              
+              # Rating distribution
+              rating_counts = Counter(ratings)
+              rating_distribution = {}
+              for i in range(1, 6):
+                  count = rating_counts.get(i, 0)
+                  rating_distribution[str(i)] = {
+                      'count': count,
+                      'percentage': round((count / total_feedbacks) * 100, 1) if total_feedbacks > 0 else 0
+                  }
+              
+              # Scooter type statistics
+              scooter_type_stats = {}
+              for scooter_type in ['gyroscooter', 'eBike', 'segway']:
+                  type_feedbacks = [f for f in feedbacks if f['scooter_type'] == scooter_type]
+                  type_count = len(type_feedbacks)
+                  
+                  if type_count > 0:
+                      type_ratings = [int(f['rating']) for f in type_feedbacks]
+                      type_sentiments = [f['sentiment'] for f in type_feedbacks]
+                      type_sentiment_counts = Counter(type_sentiments)
+                      
+                      scooter_type_stats[scooter_type] = {
+                          'total_feedbacks': type_count,
+                          'average_rating': round(sum(type_ratings) / len(type_ratings), 2),
+                          'sentiment_breakdown': {
+                              'positive': type_sentiment_counts.get('positive', 0),
+                              'negative': type_sentiment_counts.get('negative', 0),
+                              'neutral': type_sentiment_counts.get('neutral', 0),
+                              'mixed': type_sentiment_counts.get('mixed', 0)
+                          }
+                      }
+                  else:
+                      scooter_type_stats[scooter_type] = {
+                          'total_feedbacks': 0,
+                          'average_rating': 0,
+                          'sentiment_breakdown': {
+                              'positive': 0,
+                              'negative': 0,
+                              'neutral': 0,
+                              'mixed': 0
+                          }
+                      }
+              
+              # Overall statistics
+              average_rating = round(sum(ratings) / len(ratings), 2) if ratings else 0
+              average_sentiment_score = round(sum(sentiment_scores) / len(sentiment_scores), 3) if sentiment_scores else 0
+              
+              return {
+                  'total_feedbacks': total_feedbacks,
+                  'sentiment_distribution': sentiment_percentages,
+                  'rating_distribution': rating_distribution,
+                  'scooter_type_stats': scooter_type_stats,
+                  'average_rating': average_rating,
+                  'average_sentiment_score': average_sentiment_score,
+                  'summary': {
+                      'most_popular_scooter': max(scooter_type_stats.keys(), 
+                                                key=lambda x: scooter_type_stats[x]['total_feedbacks']),
+                      'overall_sentiment': max(sentiment_distribution.keys(), key=sentiment_distribution.get),
+                      'satisfaction_rate': round((sentiment_counts.get('positive', 0) / total_feedbacks) * 100, 1) if total_feedbacks > 0 else 0
+                  }
+              }
+
+          def create_response(status_code, body):
+              """
+              Create standardized API response
+              """
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+                      'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+                  },
+                  'body': json.dumps(body, default=str)
+              }
+
+      MemorySize: 128
+      Timeout: 30
+
+  GetAnalyticsUsersFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: GetAnalyticsUsers
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !Ref LabRoleArn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from boto3.dynamodb.conditions import Attr
+          from collections import Counter, defaultdict
+          from datetime import datetime, timedelta
+          import logging
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Initialize DynamoDB
+          dynamodb = boto3.resource('dynamodb')
+          USERS_TABLE = dynamodb.Table('Users')
+          USER_SESSIONS_TABLE = dynamodb.Table('UserSessions')
+
+          def lambda_handler(event, context):
+              """
+              Get comprehensive users analytics from Users table + UserSessions table
+              """
+              
+              try:
+                  # Scan all users
+                  users_response = USERS_TABLE.scan()
+                  users = users_response.get('Items', [])
+                  
+                  # Scan all user sessions
+                  sessions_response = USER_SESSIONS_TABLE.scan()
+                  sessions = sessions_response.get('Items', [])
+                  
+                  if not users:
+                      return create_response(200, {
+                          'total_users': 0,
+                          'users_by_role': {},
+                          'login_activity': {},
+                          'user_engagement': {}
+                      })
+                  
+                  # Calculate basic user analytics
+                  total_users = len(users)
+                  
+                  # Users by role (0 = Customer, 1 = Franchise)
+                  roles = [int(user['role']) for user in users]
+                  role_counts = Counter(roles)
+                  
+                  users_by_role = {
+                      'customers': role_counts.get(0, 0),
+                      'franchises': role_counts.get(1, 0)
+                  }
+                  
+                  # User distribution percentages
+                  role_percentages = {}
+                  for role_name, count in users_by_role.items():
+                      role_percentages[role_name] = {
+                          'count': count,
+                          'percentage': round((count / total_users) * 100, 1) if total_users > 0 else 0
+                      }
+                  
+                  # Process session data for user activity analytics
+                  user_activity = analyze_user_sessions(sessions, users)
+                  
+                  # Calculate user engagement metrics
+                  engagement_metrics = calculate_engagement_metrics(users, sessions)
+                  
+                  # Sample user data with login info
+                  sample_users = create_sample_users_with_activity(users, sessions)
+                  
+                  analytics_data = {
+                      'total_users': total_users,
+                      'users_by_role': role_percentages,
+                      'role_summary': {
+                          'total_customers': users_by_role['customers'],
+                          'total_franchises': users_by_role['franchises'],
+                          'customer_to_franchise_ratio': round(
+                              users_by_role['customers'] / max(users_by_role['franchises'], 1), 2
+                          )
+                      },
+                      'login_activity': user_activity,
+                      'user_engagement': engagement_metrics,
+                      'sample_users': sample_users,
+                      'session_overview': {
+                          'total_sessions': len(sessions),
+                          'users_with_sessions': len(set([s.get('user_id') for s in sessions if s.get('user_id')])),
+                          'users_never_logged_in': total_users - len(set([s.get('user_id') for s in sessions if s.get('user_id')]))
+                      },
+                      'last_updated': datetime.utcnow().isoformat() + 'Z'
+                  }
+                  
+                  logger.info(f"Generated comprehensive user analytics for {total_users} users with {len(sessions)} sessions")
+                  return create_response(200, analytics_data)
+                  
+              except Exception as e:
+                  logger.error(f"Error generating user analytics: {str(e)}")
+                  return create_response(500, {'error': 'Internal server error'})
+
+          def analyze_user_sessions(sessions, users):
+              """
+              Analyze user login patterns and activity
+              """
+              if not sessions:
+                  return {
+                      'active_users_today': 0,
+                      'active_users_week': 0,
+                      'total_login_sessions': 0,
+                      'average_sessions_per_user': 0
+                  }
+              
+              # Time calculations
+              now = datetime.utcnow()
+              today = now.date()
+              week_ago = now - timedelta(days=7)
+              
+              # Session analysis
+              user_sessions = defaultdict(list)
+              total_sessions = len(sessions)
+              
+              active_today = set()
+              active_week = set()
+              
+              for session in sessions:
+                  user_id = session.get('user_id')
+                  if not user_id:
+                      continue
+                      
+                  user_sessions[user_id].append(session)
+                  
+                  # Check login time for activity tracking
+                  login_time_str = session.get('login_time')
+                  if login_time_str:
+                      try:
+                          login_time = datetime.fromisoformat(login_time_str.replace('Z', '+00:00'))
+                          
+                          # Active today
+                          if login_time.date() == today:
+                              active_today.add(user_id)
+                          
+                          # Active this week
+                          if login_time >= week_ago:
+                              active_week.add(user_id)
+                              
+                      except:
+                          pass
+              
+              # Calculate averages
+              users_with_sessions = len(user_sessions)
+              avg_sessions_per_user = round(total_sessions / max(users_with_sessions, 1), 2)
+              
+              # Most active users
+              most_active = [
+                  {
+                      'user_id': user_id[:8] + '...',
+                      'session_count': len(user_sessions[user_id])
+                  }
+                  for user_id in sorted(user_sessions.keys(), key=lambda x: len(user_sessions[x]), reverse=True)[:5]
+              ]
+              
+              return {
+                  'active_users_today': len(active_today),
+                  'active_users_week': len(active_week),
+                  'total_login_sessions': total_sessions,
+                  'users_with_login_history': users_with_sessions,
+                  'average_sessions_per_user': avg_sessions_per_user,
+                  'most_active_users': most_active,
+                  'activity_rates': {
+                      'daily_activity_rate': round((len(active_today) / len(users)) * 100, 1) if users else 0,
+                      'weekly_activity_rate': round((len(active_week) / len(users)) * 100, 1) if users else 0
+                  }
+              }
+
+          def calculate_engagement_metrics(users, sessions):
+              """
+              Calculate user engagement and retention metrics
+              """
+              if not sessions:
+                  return {
+                      'user_retention': {
+                          'registered_but_never_logged_in': len(users),
+                          'retention_rate': 0
+                      }
+                  }
+              
+              # Users who have logged in
+              users_with_sessions = set([s.get('user_id') for s in sessions if s.get('user_id')])
+              users_never_logged_in = len(users) - len(users_with_sessions)
+              
+              # Session duration analysis
+              session_durations = []
+              for session in sessions:
+                  duration = session.get('session_duration')
+                  if duration:
+                      try:
+                          session_durations.append(int(duration))
+                      except:
+                          pass
+              
+              avg_session_duration = round(sum(session_durations) / len(session_durations), 2) if session_durations else 0
+              
+              # Retention rate (users who logged in vs total users)
+              retention_rate = round((len(users_with_sessions) / len(users)) * 100, 1) if users else 0
+              
+              # User role engagement
+              role_engagement = analyze_role_engagement(users, sessions)
+              
+              return {
+                  'user_retention': {
+                      'users_who_logged_in': len(users_with_sessions),
+                      'registered_but_never_logged_in': users_never_logged_in,
+                      'retention_rate': retention_rate
+                  },
+                  'session_quality': {
+                      'average_session_duration_minutes': avg_session_duration,
+                      'total_sessions_analyzed': len(session_durations)
+                  },
+                  'role_engagement': role_engagement
+              }
+
+          def analyze_role_engagement(users, sessions):
+              """
+              Analyze engagement by user role
+              """
+              # Create user role mapping
+              user_roles = {}
+              for user in users:
+                  # Map user email to role for session analysis
+                  user_roles[user['email']] = 'customer' if int(user['role']) == 0 else 'franchise'
+              
+              # Analyze sessions by role
+              role_sessions = defaultdict(int)
+              role_users_active = defaultdict(set)
+              
+              for session in sessions:
+                  user_role = session.get('user_role', 'unknown')
+                  user_id = session.get('user_id')
+                  
+                  if user_role != 'unknown':
+                      role_sessions[user_role] += 1
+                      if user_id:
+                          role_users_active[user_role].add(user_id)
+              
+              engagement_by_role = {}
+              for role in ['customer', 'franchise']:
+                  total_users_in_role = sum(1 for user in users if (int(user['role']) == 0 and role == 'customer') or (int(user['role']) == 1 and role == 'franchise'))
+                  active_users_in_role = len(role_users_active.get(role, set()))
+                  
+                  engagement_by_role[role] = {
+                      'total_users': total_users_in_role,
+                      'active_users': active_users_in_role,
+                      'total_sessions': role_sessions.get(role, 0),
+                      'engagement_rate': round((active_users_in_role / max(total_users_in_role, 1)) * 100, 1)
+                  }
+              
+              return engagement_by_role
+
+          def create_sample_users_with_activity(users, sessions):
+              """
+              Create sample user data enriched with login activity
+              """
+              # Create session count mapping
+              user_session_counts = defaultdict(int)
+              user_last_login = {}
+              
+              for session in sessions:
+                  user_id = session.get('user_id')
+                  if user_id:
+                      user_session_counts[user_id] += 1
+                      
+                      login_time = session.get('login_time')
+                      if login_time:
+                          if user_id not in user_last_login or login_time > user_last_login[user_id]:
+                              user_last_login[user_id] = login_time
+              
+              sample_users = []
+              for user in users[:5]:  # First 5 users
+                  user_email = user['email']
+                  
+                  # Try to find session data by email (since some sessions might use email as user_id)
+                  session_count = user_session_counts.get(user_email, 0)
+                  last_login = user_last_login.get(user_email, 'Never')
+                  
+                  sample_users.append({
+                      'email': user_email,
+                      'name': user['name'],
+                      'role': 'customer' if int(user['role']) == 0 else 'franchise',
+                      'total_sessions': session_count,
+                      'last_login': last_login,
+                      'status': 'active' if session_count > 0 else 'registered_only'
+                  })
+              
+              return sample_users
+
+          def create_response(status_code, body):
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+                      'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+                  },
+                  'body': json.dumps(body, default=str)
+              }
+      MemorySize: 128
+      Timeout: 30
+
+  GetAnalyticsTripsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: GetAnalyticsTrips
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !Ref LabRoleArn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from collections import Counter
+          from datetime import datetime, timedelta
+          from decimal import Decimal
+          import logging
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Initialize DynamoDB
+          dynamodb = boto3.resource('dynamodb')
+          TRIPS_TABLE = dynamodb.Table('Trips')
+
+          def lambda_handler(event, context):
+              """
+              Get trips analytics from Trips table
+              """
+              
+              try:
+                  # Scan all trips
+                  response = TRIPS_TABLE.scan()
+                  trips = response.get('Items', [])
+                  
+                  if not trips:
+                      return create_response(200, {
+                          'total_trips': 0,
+                          'total_revenue': 0,
+                          'trips_by_status': {},
+                          'average_trip_price': 0
+                      })
+                  
+                  # Calculate analytics
+                  total_trips = len(trips)
+                  
+                  # Trip status breakdown
+                  statuses = [trip['status'] for trip in trips]
+                  status_counts = Counter(statuses)
+                  
+                  # Revenue calculations
+                  prices = [float(trip['price']) for trip in trips if 'price' in trip and trip['price']]
+                  total_revenue = sum(prices)
+                  average_price = round(total_revenue / len(prices), 2) if prices else 0
+                  
+                  # Completed trips analysis
+                  completed_trips = [trip for trip in trips if trip['status'] == 'completed']
+                  completed_revenue = sum([float(trip['price']) for trip in completed_trips if 'price' in trip])
+                  
+                  # Status distribution with percentages
+                  status_percentages = {}
+                  for status, count in status_counts.items():
+                      status_percentages[status] = {
+                          'count': count,
+                          'percentage': round((count / total_trips) * 100, 1) if total_trips > 0 else 0
+                      }
+                  
+                  # Price ranges
+                  if prices:
+                      price_ranges = {
+                          'under_5': len([p for p in prices if p < 5]),
+                          '5_to_20': len([p for p in prices if 5 <= p < 20]),
+                          '20_to_50': len([p for p in prices if 20 <= p < 50]),
+                          'over_50': len([p for p in prices if p >= 50])
+                      }
+                  else:
+                      price_ranges = {'under_5': 0, '5_to_20': 0, '20_to_50': 0, 'over_50': 0}
+                  
+                  # Popular scooters (by trip count)
+                  scooter_usage = Counter([trip['scooter_id'] for trip in trips if 'scooter_id' in trip])
+                  top_scooters = [
+                      {'scooter_id': scooter_id[:8] + '...', 'trip_count': count}
+                      for scooter_id, count in scooter_usage.most_common(5)
+                  ]
+                  
+                  analytics_data = {
+                      'total_trips': total_trips,
+                      'total_revenue': round(total_revenue, 2),
+                      'average_trip_price': average_price,
+                      'trips_by_status': status_percentages,
+                      'revenue_breakdown': {
+                          'completed_trips_revenue': round(completed_revenue, 2),
+                          'pending_trips': total_trips - len(completed_trips),
+                          'completion_rate': round((len(completed_trips) / total_trips) * 100, 1) if total_trips > 0 else 0
+                      },
+                      'price_distribution': price_ranges,
+                      'top_scooters': top_scooters,
+                      'last_updated': datetime.utcnow().isoformat() + 'Z'
+                  }
+                  
+                  logger.info(f"Generated trip analytics for {total_trips} trips")
+                  return create_response(200, analytics_data)
+                  
+              except Exception as e:
+                  logger.error(f"Error generating trip analytics: {str(e)}")
+                  return create_response(500, {'error': 'Internal server error'})
+
+          def create_response(status_code, body):
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+                      'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+                  },
+                  'body': json.dumps(body, default=str)
+              }
+      MemorySize: 128
+      Timeout: 30
+
+  GetAnalyticsScootersFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: GetAnalyticsScooters
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !Ref LabRoleArn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from collections import Counter
+          from datetime import datetime
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              """
+              Get scooters analytics from Scooters table
+              """
+              
+              try:
+                  dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
+                  SCOOTERS_TABLE = dynamodb.Table('Scooters')
+                  
+                  response = SCOOTERS_TABLE.scan()
+                  scooters = response.get('Items', [])
+                  
+                  if not scooters:
+                      return create_response(200, {
+                          'total_scooters': 0,
+                          'scooters_by_status': {},
+                          'fleet_health': {}
+                      })
+                  
+                  total_scooters = len(scooters)
+                  
+                  statuses = []
+                  for scooter in scooters:
+                      if 'status' in scooter:
+                          statuses.append(scooter['status'])
+                  
+                  status_counts = Counter(statuses)
+                  
+                  status_percentages = {}
+                  for status, count in status_counts.items():
+                      status_percentages[status] = {
+                          'count': count,
+                          'percentage': round((count / total_scooters) * 100, 1) if total_scooters > 0 else 0
+                      }
+                  
+                  available_count = status_counts.get('available', 0)
+                  in_use_count = status_counts.get('in_use', 0)
+                  maintenance_count = status_counts.get('maintenance', 0)
+                  
+                  fleet_utilization = round((in_use_count / total_scooters) * 100, 1) if total_scooters > 0 else 0
+                  availability_rate = round((available_count / total_scooters) * 100, 1) if total_scooters > 0 else 0
+                  
+                  battery_levels = []
+                  models = []
+                  
+                  for scooter in scooters:
+                      try:
+                          if 'metadata' in scooter and scooter['metadata']:
+                              metadata = scooter['metadata']
+                              
+                              if isinstance(metadata, dict):
+                                  if 'battery' in metadata:
+                                      battery_levels.append(int(metadata['battery']))
+                                  if 'model' in metadata:
+                                      models.append(metadata['model'])
+                              elif isinstance(metadata, str):
+                                  try:
+                                      metadata_dict = json.loads(metadata)
+                                      if 'battery' in metadata_dict:
+                                          battery_levels.append(int(metadata_dict['battery']))
+                                      if 'model' in metadata_dict:
+                                          models.append(metadata_dict['model'])
+                                  except json.JSONDecodeError:
+                                      import re
+                                      battery_match = re.search(r'"battery":\s*\{?"?N"?\s*:\s*"?(\d+)"?', metadata)
+                                      if battery_match:
+                                          battery_levels.append(int(battery_match.group(1)))
+                                      
+                                      model_match = re.search(r'"model":\s*\{?"?S"?\s*:\s*"([^"]+)"', metadata)
+                                      if model_match:
+                                          models.append(model_match.group(1))
+                      except:
+                          continue
+                  
+                  if battery_levels:
+                      avg_battery = round(sum(battery_levels) / len(battery_levels), 1)
+                      low_battery_count = len([b for b in battery_levels if b < 30])
+                      battery_stats = {
+                          'average_battery_level': avg_battery,
+                          'low_battery_scooters': low_battery_count,
+                          'battery_ranges': {
+                              'critical_0_20': len([b for b in battery_levels if 0 <= b < 20]),
+                              'low_20_50': len([b for b in battery_levels if 20 <= b < 50]),
+                              'good_50_80': len([b for b in battery_levels if 50 <= b < 80]),
+                              'excellent_80_100': len([b for b in battery_levels if 80 <= b <= 100])
+                          }
+                      }
+                  else:
+                      battery_stats = {
+                          'average_battery_level': 0,
+                          'low_battery_scooters': 0,
+                          'battery_ranges': {'critical_0_20': 0, 'low_20_50': 0, 'good_50_80': 0, 'excellent_80_100': 0}
+                      }
+                  
+                  model_counts = Counter(models) if models else {}
+                  model_distribution = {model: count for model, count in model_counts.most_common()}
+                  
+                  franchises = [scooter['franchise_id'] for scooter in scooters if 'franchise_id' in scooter]
+                  franchise_counts = Counter(franchises)
+                  
+                  analytics_data = {
+                      'total_scooters': total_scooters,
+                      'scooters_by_status': status_percentages,
+                      'fleet_health': {
+                          'fleet_utilization_rate': fleet_utilization,
+                          'availability_rate': availability_rate,
+                          'maintenance_rate': round((maintenance_count / total_scooters) * 100, 1) if total_scooters > 0 else 0
+                      },
+                      'battery_analytics': battery_stats,
+                      'model_distribution': model_distribution,
+                      'franchise_distribution': {
+                          'total_franchises': len(franchise_counts),
+                          'scooters_per_franchise': dict(franchise_counts)
+                      },
+                      'operational_summary': {
+                          'ready_for_use': available_count,
+                          'currently_rented': in_use_count,
+                          'needs_attention': maintenance_count
+                      },
+                      'last_updated': datetime.utcnow().isoformat() + 'Z'
+                  }
+                  
+                  return create_response(200, analytics_data)
+                  
+              except Exception as e:
+                  logger.error(f"Error: {str(e)}")
+                  return create_response(500, {'error': 'Internal server error'})
+
+          def create_response(status_code, body):
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+                      'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+                  },
+                  'body': json.dumps(body, default=str)
+              }
+      MemorySize: 128
+      Timeout: 30
+
+  GetAnalyticsLoginsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: GetAnalyticsLogins
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !Ref LabRoleArn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from collections import Counter
+          from datetime import datetime, timedelta
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              """
+              Get login analytics from UserSessions table
+              """
+              
+              try:
+                  dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
+                  USER_SESSIONS_TABLE = dynamodb.Table('UserSessions')
+                  
+                  response = USER_SESSIONS_TABLE.scan()
+                  sessions = response.get('Items', [])
+                  
+                  if not sessions:
+                      return create_response(200, {
+                          'total_sessions': 0,
+                          'active_sessions': 0,
+                          'average_session_duration': 0
+                      })
+                  
+                  total_sessions = len(sessions)
+                  
+                  durations = []
+                  active_sessions = 0
+                  
+                  for session in sessions:
+                      if 'session_duration' in session and session['session_duration']:
+                          try:
+                              durations.append(int(session['session_duration']))
+                          except:
+                              pass
+                      
+                      if 'logout_time' not in session or not session['logout_time']:
+                          active_sessions += 1
+                  
+                  if durations:
+                      avg_duration = round(sum(durations) / len(durations), 2)
+                      max_duration = max(durations)
+                      min_duration = min(durations)
+                  else:
+                      avg_duration = max_duration = min_duration = 0
+                  
+                  user_roles = [session.get('user_role', 'unknown') for session in sessions]
+                  role_counts = Counter(user_roles)
+                  
+                  login_times = []
+                  for session in sessions:
+                      if 'login_time' in session and session['login_time']:
+                          try:
+                              login_time = datetime.fromisoformat(session['login_time'].replace('Z', '+00:00'))
+                              login_times.append(login_time)
+                          except:
+                              pass
+                  
+                  hourly_logins = Counter()
+                  daily_logins = Counter()
+                  
+                  for login_time in login_times:
+                      hourly_logins[login_time.hour] += 1
+                      daily_logins[login_time.strftime('%Y-%m-%d')] += 1
+                  
+                  peak_hours = [
+                      {'hour': f"{hour}:00", 'login_count': count}
+                      for hour, count in hourly_logins.most_common(5)
+                  ]
+                  
+                  seven_days_ago = datetime.utcnow() - timedelta(days=7)
+                  recent_sessions = []
+                  for s in sessions:
+                      if 'login_time' in s and s['login_time']:
+                          try:
+                              login_dt = datetime.fromisoformat(s['login_time'].replace('Z', '+00:00'))
+                              if login_dt > seven_days_ago:
+                                  recent_sessions.append(s)
+                          except:
+                              pass
+                  
+                  user_agents = [session.get('user_agent', 'unknown') for session in sessions if 'user_agent' in session]
+                  device_types = categorize_devices(user_agents)
+                  
+                  analytics_data = {
+                      'total_sessions': total_sessions,
+                      'active_sessions': active_sessions,
+                      'session_analytics': {
+                          'average_duration_minutes': avg_duration,
+                          'max_duration_minutes': max_duration,
+                          'min_duration_minutes': min_duration,
+                          'completion_rate': round(((total_sessions - active_sessions) / total_sessions) * 100, 1) if total_sessions > 0 else 0
+                      },
+                      'user_role_breakdown': dict(role_counts),
+                      'login_patterns': {
+                          'peak_hours': peak_hours,
+                          'total_unique_days': len(daily_logins),
+                          'recent_activity_7_days': len(recent_sessions)
+                      },
+                      'device_analytics': device_types,
+                      'session_health': {
+                          'sessions_with_logout': total_sessions - active_sessions,
+                          'incomplete_sessions': active_sessions,
+                          'data_completeness': round((len([s for s in sessions if 'session_duration' in s and s['session_duration']]) / total_sessions) * 100, 1) if total_sessions > 0 else 0
+                      },
+                      'last_updated': datetime.utcnow().isoformat() + 'Z'
+                  }
+                  
+                  return create_response(200, analytics_data)
+                  
+              except Exception as e:
+                  logger.error(f"Error: {str(e)}")
+                  return create_response(500, {'error': f'Internal server error: {str(e)}'})
+
+          def categorize_devices(user_agents):
+              mobile_count = 0
+              desktop_count = 0
+              tablet_count = 0
+              unknown_count = 0
+              
+              for ua in user_agents:
+                  ua_lower = ua.lower() if ua else ''
+                  if any(mobile in ua_lower for mobile in ['mobile', 'android', 'iphone']):
+                      mobile_count += 1
+                  elif any(tablet in ua_lower for tablet in ['tablet', 'ipad']):
+                      tablet_count += 1
+                  elif any(desktop in ua_lower for desktop in ['windows', 'macintosh', 'linux']):
+                      desktop_count += 1
+                  else:
+                      unknown_count += 1
+              
+              return {
+                  'mobile': mobile_count,
+                  'desktop': desktop_count,
+                  'tablet': tablet_count,
+                  'unknown': unknown_count
+              }
+
+          def create_response(status_code, body):
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+                      'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+                  },
+                  'body': json.dumps(body, default=str)
+              }
+      MemorySize: 128
+      Timeout: 30
+
+  DeleteFeedbackFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: DeleteFeedback
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !Ref LabRoleArn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from datetime import datetime
+          import logging
+          import base64
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Initialize DynamoDB
+          dynamodb = boto3.resource('dynamodb')
+          FEEDBACKS_TABLE = dynamodb.Table('Feedbacks')
+
+          def lambda_handler(event, context):
+              '''
+              Delete feedback Lambda function with user authorization
+              DELETE /feedbacks/{feedback_id}
+              '''
+              
+              try:
+                  logger.info(f"Received event: {json.dumps(event)}")
+                  
+                  # Extract feedback_id from path parameters
+                  path_parameters = event.get('pathParameters') or {}
+                  feedback_id = path_parameters.get('feedback_id')
+                  
+                  logger.info(f"Feedback ID to delete: {feedback_id}")
+                  
+                  if not feedback_id:
+                      return create_response(400, {'error': 'feedback_id path parameter is required'})
+                  
+                  # Extract user ID from JWT token
+                  requesting_user_id = extract_user_id_from_token(event)
+                  
+                  logger.info(f"Requesting user ID: {requesting_user_id}")
+                  
+                  if not requesting_user_id:
+                      return create_response(401, {'error': 'User authentication required'})
+                  
+                  # Check if feedback exists and get user_id
+                  try:
+                      logger.info(f"Getting feedback item from DynamoDB: {feedback_id}")
+                      get_response = FEEDBACKS_TABLE.get_item(
+                          Key={'feedback_id': feedback_id}
+                      )
+                      
+                      logger.info(f"DynamoDB get_item response: {get_response}")
+                      
+                      if 'Item' not in get_response:
+                          return create_response(404, {'error': 'Feedback not found'})
+                      
+                      feedback_item = get_response['Item']
+                      feedback_owner_id = feedback_item.get('user_id')
+                      
+                      logger.info(f"Feedback owner ID: {feedback_owner_id}")
+                      logger.info(f"Requesting user ID: {requesting_user_id}")
+                      
+                      # Check if the requesting user owns this feedback
+                      if feedback_owner_id != requesting_user_id:
+                          return create_response(403, {'error': 'You can only delete your own feedback'})
+                      
+                      # Check if already deleted
+                      if feedback_item.get('is_deleted', False):
+                          return create_response(410, {'error': 'Feedback already deleted'})
+                          
+                  except Exception as e:
+                      logger.error(f"Error checking feedback ownership: {str(e)}")
+                      return create_response(500, {'error': 'Error accessing feedback data'})
+                  
+                  # Soft delete the feedback
+                  try:
+                      logger.info(f"Updating feedback to mark as deleted: {feedback_id}")
+                      update_response = FEEDBACKS_TABLE.update_item(
+                          Key={'feedback_id': feedback_id},
+                          UpdateExpression='SET is_deleted = :deleted, updated_at = :updated_at',
+                          ExpressionAttributeValues={
+                              ':deleted': True,
+                              ':updated_at': datetime.utcnow().isoformat() + 'Z'
+                          },
+                          ReturnValues='ALL_NEW'
+                      )
+                      
+                      logger.info(f"User {requesting_user_id} deleted feedback: {feedback_id}")
+                      
+                      return create_response(200, {
+                          'message': 'Feedback deleted successfully',
+                          'feedback_id': feedback_id,
+                          'deleted_at': datetime.utcnow().isoformat() + 'Z'
+                      })
+                      
+                  except Exception as e:
+                      logger.error(f"Error deleting feedback: {str(e)}")
+                      return create_response(500, {'error': 'Failed to delete feedback'})
+                  
+              except Exception as e:
+                  logger.error(f"Unexpected error in delete feedback: {str(e)}")
+                  return create_response(500, {'error': 'Internal server error'})
+
+          def extract_user_id_from_token(event):
+              """
+              Extract user ID from JWT token using simple base64 decoding
+              """
+              try:
+                  # Try to get from API Gateway authorizer first (if configured)
+                  request_context = event.get('requestContext', {})
+                  authorizer = request_context.get('authorizer', {})
+                  claims = authorizer.get('claims', {})
+                  user_id = claims.get('sub')
+                  
+                  if user_id:
+                      logger.info(f"Got user ID from authorizer: {user_id}")
+                      return user_id
+                  
+                  # Parse from Authorization header
+                  headers = event.get('headers', {})
+                  logger.info(f"Request headers: {headers}")
+                  
+                  auth_header = None
+                  for key, value in headers.items():
+                      if key.lower() == 'authorization':
+                          auth_header = value
+                          break
+                  
+                  if not auth_header:
+                      logger.error("No Authorization header found")
+                      return None
+                  
+                  if not auth_header.startswith('Bearer '):
+                      logger.error("Authorization header does not start with 'Bearer '")
+                      return None
+                  
+                  token = auth_header[7:]  # Remove "Bearer " prefix
+                  logger.info(f"Extracted token: {token[:50]}...")  # Log first 50 chars only
+                  
+                  # JWT tokens have 3 parts separated by dots
+                  parts = token.split('.')
+                  if len(parts) != 3:
+                      logger.error("Invalid JWT token format")
+                      return None
+                  
+                  # Decode the payload (second part)
+                  payload = parts[1]
+                  
+                  # Add padding if needed for base64 decoding
+                  padding = len(payload) % 4
+                  if padding:
+                      payload += '=' * (4 - padding)
+                  
+                  # Decode base64
+                  decoded_bytes = base64.urlsafe_b64decode(payload)
+                  decoded_json = json.loads(decoded_bytes.decode('utf-8'))
+                  
+                  logger.info(f"Decoded JWT payload: {decoded_json}")
+                  
+                  user_id = decoded_json.get('sub')
+                  logger.info(f"Extracted user ID from token: {user_id}")
+                  
+                  return user_id
+                  
+              except Exception as e:
+                  logger.error(f"Error extracting user ID from token: {str(e)}")
+                  import traceback
+                  logger.error(f"Traceback: {traceback.format_exc()}")
+                  return None
+
+          def create_response(status_code, body):
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+                      'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+                  },
+                  'body': json.dumps(body, default=str)
+              }
+      MemorySize: 128
+      Timeout: 30
+
+  # HTTP API Gateway
+  DalScooterHttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: api-dal-scooter
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowMethods: ['GET','POST','PUT','DELETE','OPTIONS']
+        AllowOrigins: ['*']
+        AllowHeaders: ['Content-Type','Authorization']
+  
+  # JWT Authorizer
+  CognitoAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      Name: CognitoAuthorizer
+      AuthorizerType: JWT
+      IdentitySource: ['$request.header.Authorization']
+      JwtConfiguration:
+        Audience:
+          - !Ref DalScooterUserPoolClient
+        Issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${DalScooterUserPool}'
+
+  # Stage
+  HttpApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      StageName: '$default'
+      AutoDeploy: true
+
+  # HTTP API Integrations
+  StartTripIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt StartTripFunction.Arn
+      PayloadFormatVersion: '2.0'
+  EndTripIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt EndTripFunction.Arn
+      PayloadFormatVersion: '2.0'
+  GetTripsByUserIdIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt GetTripsByUserIdFunction.Arn
+      PayloadFormatVersion: '2.0'
+  CreateScooterIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt CreateScooterFunction.Arn
+      PayloadFormatVersion: '2.0'
+  GetAllScootersIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt GetAllScootersFunction.Arn
+      PayloadFormatVersion: '2.0'
+  GetScooterByIdIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt GetScooterByIdFunction.Arn
+      PayloadFormatVersion: '2.0'
+  UpdateScooterByIdIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt UpdateScooterByIdFunction.Arn
+      PayloadFormatVersion: '2.0'
+  DeleteScooterByIdIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt DeleteScooterByIdFunction.Arn
+      PayloadFormatVersion: '2.0'
+  UserRegisterIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt UserRegisterFunction.Arn
+      PayloadFormatVersion: '2.0'
+  FetchSecurityAnswerIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt FetchSecurityAnswerFunction.Arn
+      PayloadFormatVersion: '2.0'
+  FetchShiftKeyIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt FetchShiftKeyFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  # HTTP API Integrations for Chat Module
+  SendCustomerMessageIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt SendCustomerMessageFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  AcceptPendingChatRequestIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt AcceptPendingChatRequestFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  GetMessagesByTripIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt GetMessagesByTripFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  GetPendingChatRequestsIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt GetPendingChatRequestsFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  CreatePendingChatRequestIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt CreatePendingChatRequestFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  GetAcceptedChatsIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt GetAcceptedChatsFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  SubmitFeedbackIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt SubmitFeedbackFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  GetFeedbacksPublicIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt GetFeedbacksFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  GetFeedbacksByIdIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt GetFeedbacksByIdFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  DeleteFeedbackIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt DeleteFeedbackFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  GetFeedbacksIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt GetFeedbacksFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  GetAnalyticsUsersIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt GetAnalyticsUsersFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  GetAnalyticsTripsIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt GetAnalyticsTripsFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  GetFeedbackAnalyticsIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt GetFeedbackAnalyticsFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  GetAnalyticsLoginsIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt GetAnalyticsLoginsFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  GetAnalyticsScootersIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt GetAnalyticsScootersFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  SetUserSessionsFunctionIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt SetUserSessionsFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  # HTTP API Routes
+  StartTripRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      RouteKey: 'POST /trip/start'
+      Target: !Sub 'integrations/${StartTripIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+  EndTripRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      RouteKey: 'POST /trip/end'
+      Target: !Sub 'integrations/${EndTripIntegration}'  
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+  GetTripsByUserIdRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      RouteKey: 'GET /trips/{user_id}'
+      Target: !Sub 'integrations/${GetTripsByUserIdIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+  CreateScooterRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      RouteKey: 'POST /scooters'
+      Target: !Sub 'integrations/${CreateScooterIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+  GetAllScootersRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      RouteKey: 'GET /scooters'
+      Target: !Sub 'integrations/${GetAllScootersIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+  GetScooterByIdRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      RouteKey: 'GET /scooters/{scooter_id}'
+      Target: !Sub 'integrations/${GetScooterByIdIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+  UpdateScooterByIdRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      RouteKey: 'PUT /scooters/{scooter_id}'
+      Target: !Sub 'integrations/${UpdateScooterByIdIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+  DeleteScooterByIdRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      RouteKey: 'DELETE /scooters/{scooter_id}'
+      Target: !Sub 'integrations/${DeleteScooterByIdIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+  UserRegisterRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      RouteKey: 'POST /register'
+      Target: !Sub 'integrations/${UserRegisterIntegration}'
+  FetchSecurityAnswerRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      RouteKey: 'POST /getSecurityAnswer'
+      Target: !Sub 'integrations/${FetchSecurityAnswerIntegration}'
+  FetchShiftKeyRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      RouteKey: 'POST /getShiftKey'
+      Target: !Sub 'integrations/${FetchShiftKeyIntegration}'
+  
+  SendCustomerMessageRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      RouteKey: 'POST /messages/send-customer-message'
+      Target: !Sub 'integrations/${SendCustomerMessageIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+
+  AcceptPendingChatRequestRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      RouteKey: 'POST /messages/accept-request'
+      Target: !Sub 'integrations/${AcceptPendingChatRequestIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+
+  GetMessagesByTripRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      RouteKey: 'GET /messages/{trip_id}'
+      Target: !Sub 'integrations/${GetMessagesByTripIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+
+  GetPendingChatRequestsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      RouteKey: 'GET /messages/get-pending-requests'
+      Target: !Sub 'integrations/${GetPendingChatRequestsIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+
+  CreatePendingChatRequestRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      RouteKey: 'POST /messages/create-pending-request'
+      Target: !Sub 'integrations/${CreatePendingChatRequestIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+
+  GetAcceptedChatsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      RouteKey: 'GET /messages/get-accepted-chats'
+      Target: !Sub 'integrations/${GetAcceptedChatsIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+
+  SetUserSessionsFunctionRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      RouteKey: 'POST /sessions'
+      Target: !Sub 'integrations/${SetUserSessionsFunctionIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+  
+  SubmitFeedbackRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      RouteKey: 'POST /feedbacks'
+      Target: !Sub 'integrations/${SubmitFeedbackIntegration}'
+
+  GetFeedbacksPublicRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      RouteKey: 'GET /feedbacks/public'
+      Target: !Sub 'integrations/${GetFeedbacksPublicIntegration}'
+
+  GetFeedbacksByIdRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      RouteKey: 'GET /feedbacks/{feedback_id}'
+      Target: !Sub 'integrations/${GetFeedbacksByIdIntegration}'
+
+  DeleteFeedbackRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      RouteKey: 'DELETE /feedbacks/{feedback_id}'
+      Target: !Sub 'integrations/${DeleteFeedbackIntegration}'
+
+  GetFeedbacksRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      RouteKey: 'GET /feedbacks'
+      Target: !Sub 'integrations/${GetFeedbacksIntegration}'
+
+  GetAnalyticsUsersRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      RouteKey: 'GET /analytics/users'
+      Target: !Sub 'integrations/${GetAnalyticsUsersIntegration}'
+
+  GetAnalyticsTripsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      RouteKey: 'GET /analytics/trips'
+      Target: !Sub 'integrations/${GetAnalyticsTripsIntegration}'
+
+  GetFeedbackAnalyticsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      RouteKey: 'GET /analytics/feedbacks'
+      Target: !Sub 'integrations/${GetFeedbackAnalyticsIntegration}'
+
+  GetAnalyticsLoginsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      RouteKey: 'GET /analytics/logins'
+      Target: !Sub 'integrations/${GetAnalyticsLoginsIntegration}'
+
+  GetAnalyticsScootersRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref DalScooterHttpApi
+      RouteKey: 'GET /analytics/scooters'
+      Target: !Sub 'integrations/${GetAnalyticsScootersIntegration}'
+
+# Lambda Permissions so API Gateway can invoke Auth Lambdas
+  UserRegisterPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref UserRegisterFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DalScooterHttpApi}/*/POST/register'
+  FetchSecurityAnswerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FetchSecurityAnswerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DalScooterHttpApi}/*/POST/getSecurityAnswer'
+  FetchShiftKeyPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FetchShiftKeyFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DalScooterHttpApi}/*/POST/getShiftKey'
+  # Lambda Permissions so API Gateway can invoke Booking & trip Lambdas
+  StartTripPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref StartTripFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DalScooterHttpApi}/*/POST/trip/start'
+
+  EndTripPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EndTripFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DalScooterHttpApi}/*/POST/trip/end'
+
+  GetTripsByUserIdPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GetTripsByUserIdFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DalScooterHttpApi}/*/GET/trips/*'
+
+  CreateScooterPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CreateScooterFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DalScooterHttpApi}/*/POST/scooters'
+
+  GetAllScootersPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GetAllScootersFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DalScooterHttpApi}/*/GET/scooters'
+
+  GetScooterByIdPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GetScooterByIdFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DalScooterHttpApi}/*/GET/scooters/*'
+
+  UpdateScooterByIdPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref UpdateScooterByIdFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DalScooterHttpApi}/*/PUT/scooters/*'
+
+  DeleteScooterByIdPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DeleteScooterByIdFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DalScooterHttpApi}/*/DELETE/scooters/*'
+    
+  # Lambda Permissions so API Gateway can invoke Chat Lambdas
+  SendCustomerMessagePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SendCustomerMessageFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DalScooterHttpApi}/*/POST/messages/send-customer-message'
+
+  AcceptPendingChatRequestPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AcceptPendingChatRequestFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DalScooterHttpApi}/*/POST/messages/accept-request'
+
+  GetMessagesByTripPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GetMessagesByTripFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DalScooterHttpApi}/*/GET/messages/*'
+
+  GetPendingChatRequestsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GetPendingChatRequestsFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DalScooterHttpApi}/*/GET/messages/get-pending-requests'
+
+  CreatePendingChatRequestPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CreatePendingChatRequestFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DalScooterHttpApi}/*/POST/messages/create-pending-request'
+
+  GetAcceptedChatsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GetAcceptedChatsFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DalScooterHttpApi}/*/GET/messages/get-accepted-chats'
+
+  SetUserSessionsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SetUserSessionsFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DalScooterHttpApi}/*/POST/sessions'
+  
+  SubmitFeedbackPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - SubmitFeedbackRoute
+    Properties:
+      FunctionName: !Ref SubmitFeedbackFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DalScooterHttpApi}/*/POST/feedbacks'
+
+  GetFeedbacksPublicPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - GetFeedbacksPublicRoute
+    Properties:
+      FunctionName: !Ref GetFeedbacksFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DalScooterHttpApi}/*/GET/feedbacks/public'
+
+  GetFeedbacksByIdPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - GetFeedbacksByIdRoute
+    Properties:
+      FunctionName: !Ref GetFeedbacksByIdFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DalScooterHttpApi}/*/GET/feedbacks/*'
+
+  DeleteFeedbackPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - DeleteFeedbackRoute
+    Properties:
+      FunctionName: !Ref DeleteFeedbackFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DalScooterHttpApi}/*/DELETE/feedbacks/*'
+
+  GetFeedbacksPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - GetFeedbacksRoute
+    Properties:
+      FunctionName: !Ref GetFeedbacksFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DalScooterHttpApi}/*/GET/feedbacks'
+
+  GetAnalyticsUsersPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - GetAnalyticsUsersRoute
+    Properties:
+      FunctionName: !Ref GetAnalyticsUsersFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DalScooterHttpApi}/*/GET/analytics/users'
+
+  GetAnalyticsTripsPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - GetAnalyticsTripsRoute
+    Properties:
+      FunctionName: !Ref GetAnalyticsTripsFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DalScooterHttpApi}/*/GET/analytics/trips'
+
+  GetFeedbackAnalyticsPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - GetFeedbackAnalyticsRoute
+    Properties:
+      FunctionName: !Ref GetFeedbackAnalyticsFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DalScooterHttpApi}/*/GET/analytics/feedbacks'
+
+  GetAnalyticsLoginsPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - GetAnalyticsLoginsRoute
+    Properties:
+      FunctionName: !Ref GetAnalyticsLoginsFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DalScooterHttpApi}/*/GET/analytics/logins'
+
+  GetAnalyticsScootersPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - GetAnalyticsScootersRoute
+    Properties:
+      FunctionName: !Ref GetAnalyticsScootersFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DalScooterHttpApi}/*/GET/analytics/scooters'
+
+  # Permissions: Cognito PostConfirmation
+  AssignUserGroupPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AssignUserGroupFunction
+      Action: lambda:InvokeFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt DalScooterUserPool.Arn
+
+  # Cognito User Pool & Groups
+  DalScooterUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: Dal Scooter User pool
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      Schema:
+        - Name: role
+          AttributeDataType: String
+          Mutable: true
+      LambdaConfig:
+        PostConfirmation: !GetAtt AssignUserGroupFunction.Arn
+  
+  DalScooterUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: dalscooter-client
+      UserPoolId: !Ref DalScooterUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows: [USER_PASSWORD_AUTH]
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 30
+      TokenValidityUnits: { AccessToken: minutes, IdToken: minutes, RefreshToken: days }
+  
+  FranchiseGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: { GroupName: Franchise, UserPoolId: !Ref DalScooterUserPool, RoleArn: !Ref LabRoleArn, Precedence: 2 }
+  
+  UserGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: { GroupName: User, UserPoolId: !Ref DalScooterUserPool, RoleArn: !Ref LabRoleArn, Precedence: 1 }
+Outputs:
+  HttpApiId:
+    Description: Cognito HTTP API ID
+    Value: !Ref DalScooterHttpApi
+  HttpApiUrl:
+    Description: Invoke URL of the HTTP API (default stage)
+    Value: !Sub "https://${DalScooterHttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref DalScooterUserPool
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref DalScooterUserPoolClient
+  UserNotificationTopicArn:
+    Description: ARN of the SNS topic for notifications
+    Value: !Ref UserNotificationTopic
+  NotificationQueueArn:
+    Description: ARN of the SQS queue subscribed to SNS
+    Value: !GetAtt NotificationQueue.Arn

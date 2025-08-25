@@ -1,0 +1,27 @@
+{
+  "aws": {
+    "region": "us-east-1",
+    "tables": {
+      "users": "Users",
+      "feedbacks": "Feedbacks",
+      "trips": "Trips",
+      "scooters": "Scooters",
+      "pending_chats": "PendingChatRequests",
+      "user_sessions": "UserSessions",
+      "analytics": "Analytics"
+    },
+    "sns_topic_arn": "arn:aws:sns:us-east-1:395708543071:userNotification"
+  },
+  "test_settings": {
+    "max_test_items": 100,
+    "timeout_seconds": 30,
+    "enable_performance_tests": true,
+    "enable_security_tests": true,
+    "enable_integration_tests": true
+  },
+  "mock_data": {
+    "default_user_email": "test@example.com",
+    "default_trip_id": "trip123",
+    "default_scooter_id": "scooter123"
+  }
+}

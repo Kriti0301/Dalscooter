@@ -1,0 +1,10 @@
+docker buildx build \
+  --platform linux/amd64 \
+  --build-arg REACT_APP_USER_POOL_ID=xxx \
+  --build-arg REACT_APP_CLIENT_ID=xxx \
+  --build-arg REACT_APP_BACKEND_BASE_URL=https://api.example.com \
+  --build-arg REACT_APP_MAPBOX_TOKEN=xxx \
+  -t dal-scooter-frontend \
+  --load .
+
+  docker save -o dal-scooter.tar dal-scooter:latest
