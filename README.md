@@ -151,19 +151,24 @@ The `tests/` folder contains about 86 unit tests for the Lambda functions, cover
 ```bash
 cd tests
 python -m venv venv && source venv/bin/activate
-pip install boto3 "moto[dynamodb,sns,sqs,comprehend]<5" pytest coverage
-UNIT_TESTS_ONLY=true AWS_DEFAULT_REGION=us-east-1 \
-AWS_ACCESS_KEY_ID=testing AWS_SECRET_ACCESS_KEY=testing \
+pip install -r requirements.txt
+set -a; source .env.example; set +a   # fake AWS credentials for the mocks
 python main.py
 ```
 
-The tests were written against `moto` 4.x. `moto` 5 removed the per-service decorators (`mock_dynamodb` and similar) that they use.
+The tests use `moto` 4.x (pinned in `requirements.txt`). `moto` 5 removed the per-service decorators (`mock_dynamodb` and similar) that they rely on.
+
+Frontend tests:
+
+```bash
+cd frontend
+npm test
+```
 
 ---
 
 ## Known limitations
 
 - The full system needs an AWS deployment. There is no local or offline backend mode.
-- `frontend/src/App.test.js` is still the default Create React App placeholder test and does not reflect the real app.
-- The test dependencies need `moto` < 5. `tests/requirements.txt` also lists `decimal` and `concurrent.futures`, which are part of Python's standard library and should not be installed with pip.
+- Frontend test coverage is minimal: `frontend/src/App.test.js` only covers the role-detection helper.
 - `customer-api/` is a small, standalone prototype and is not wired into the CloudFormation stack.
